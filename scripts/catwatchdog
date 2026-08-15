@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# catwatchdog <catwalk-pid> - wait for a catwalk to die, then discard the
+# terminal's sixel graphics layer. Launched via setsid so it is immune to the
+# signals tmux sends the pane's process group on kill-pane/window/session.
+
+set -u
+
+CAT_PID="$1"
+
+while kill -0 "$CAT_PID" 2>/dev/null; do
+    sleep 1
+done
+
+sleep 0.3
+exec "$(dirname "$0")/catclear"

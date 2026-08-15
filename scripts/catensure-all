@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# catensure-all - spawn a catwalk in every window that lacks one. Catch-up
+# pass used by the hooks, after plugin load on a running server, and after a
+# resurrect restore.
+#
+# While a resurrect restore is in progress, restored windows are still being
+# populated with their saved layouts (which include saved catwalk panes).
+# Spawning then would create an extra pane, so we defer; the resurrect
+# post-restore-all hook re-runs this with --restored once the restore finished.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=helpers.sh
+. "$SCRIPT_DIR/helpers.sh"
+
+[[ "$(catopt cats-on 1)" == "1" ]] || exit 0
+
+if [[ "${1:-}" != "--restored" ]]; then
+    # defer while tmux-resurrect is actively restoring
+    if pgrep -f '[t]mux-resurrect/scripts/restore\.sh' >/dev/null 2>&1; then
+        exit 0
+    fi
+fi
+
+while read -r win; do
+    [[ -z "$win" ]] && continue
+    "$SCRIPT_DIR/catensure" "$win"
+done < <(tmux list-windows -a -F '#{window_id}' 2>/dev/null)

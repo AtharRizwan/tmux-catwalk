@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# catensure [window-target] - spawn a catwalk pane in a window if it lacks
+# one. Used by the session-created / after-new-window hooks and catensure-all.
+#
+# Window resolution order:
+#   1. explicit arg (catensure-all passes #{window_id})
+#   2. TMUX_PANE  -> reliable in after-new-window (run-shell sets it to the
+#                    new window's pane)
+#   3. `display -p -t :` -> session's current window; reliable in
+#                    session-created, where TMUX_PANE points at a pane that
+#                    does not exist yet.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=helpers.sh
+. "$SCRIPT_DIR/helpers.sh"
+
+# Respect the master switch
+[[ "$(catopt cats-on 1)" == "1" ]] || exit 0
+
+# Sanity gate: spawning only makes sense if sixel passthrough is configured.
+if [[ "$(catopt catwalk-sixel-check 1)" == "1" ]]; then
+    if ! tmux show-options -gv terminal-features 2>/dev/null | grep -q sixel; then
+        exit 0
+    fi
+fi
+
+WIN="${1:-}"
+
+if [[ -z "$WIN" && -n "${TMUX_PANE:-}" ]]; then
+    WIN="$(tmux display -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null)"
+fi
+if [[ -z "$WIN" ]]; then
+    WIN="$(tmux display -p -t : '#{window_id}' 2>/dev/null)"
+fi
+[[ -n "$WIN" ]] || exit 0
+
+# One cat per window, never a double.
+if tmux list-panes -t "$WIN" -F '#{pane_start_command}' 2>/dev/null | grep -q catwalk; then
+    exit 0
+fi
+
+HEIGHT="$(catcfg CATWALK_HEIGHT catwalk-height 3)"
+
+# Width is left to the catwalk script: it derives its own columns from the
+# height + GIF aspect (or honors @catwalk-width) so no env is forced here.
+tmux split-window -t "$WIN" -d -f -b -l "$HEIGHT" \
+    -e "CATWALK_HEIGHT=$HEIGHT" \
+    "$SCRIPT_DIR/catwalk" 2>/dev/null
