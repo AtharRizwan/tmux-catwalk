@@ -45,6 +45,9 @@ HEIGHT="$(catcfg CATWALK_HEIGHT catwalk-height 3)"
 
 # Width is left to the catwalk script: it derives its own columns from the
 # height + GIF aspect (or honors @catwalk-width) so no env is forced here.
-tmux split-window -t "$WIN" -d -f -b -l "$HEIGHT" \
+# Pane is HEIGHT+1 rows so tmux's sixel clip (screen_size_y-1) has room and
+# the full cat image is visible.
+PANE_HEIGHT=$((HEIGHT + 1))
+tmux split-window -t "$WIN" -d -f -b -l "$PANE_HEIGHT" \
     -e "CATWALK_HEIGHT=$HEIGHT" \
     "$SCRIPT_DIR/catwalk" 2>/dev/null

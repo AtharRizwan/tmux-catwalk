@@ -15,6 +15,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GIF="$(catcfg CATWALK_GIF catwalk-gif "$CATWALK_PLUGIN_DIR/cat.gif")"
 CACHE="$(catcache)"
 HEIGHT_ROWS="$(catcfg CATWALK_HEIGHT catwalk-height 3)" # rows the cat occupies
+# Terminal cell size in pixels (11x26 for this Konsole). The sixel canvas is
+# normalized to CATW x HEIGHT_ROWS of these cells so the cat always fills the
+# same number of rows regardless of chafa's own cell geometry.
+CELLPX="$(catcfg CATWALK_CELL_PX catwalk-cell-px '11x26')"
+CELLW="${CELLPX%[xX]*}"
+CELLH="${CELLPX#*[xX]}"
+[[ "$CELLW" =~ ^[0-9]+$ && "$CELLH" =~ ^[0-9]+$ ]] || { CELLW=11; CELLH=26; }
+# 6px bands of headroom to add above the cat's head (shifts the cat down).
+TOPPAD="$(catcfg CATWALK_TOP_PAD catwalk-top-pad 1)"
+[[ "$TOPPAD" =~ ^[0-9]+$ ]] || TOPPAD=1
 # Width in columns: an explicit @catwalk-width / CATWALK_WIDTH wins; otherwise
 # derive it from @catwalk-height and the GIF's own proportions so the cat stays
 # proportionate at any height. RATIO approximates a terminal cell's height/width
@@ -31,7 +41,17 @@ if [[ -z "$CATW" ]]; then
     fi
 fi
 STEP="$(catcfg CATWALK_STEP catwalk-step 1)" # cells to advance per tick
+DIRECTION="$(catcfg CATWALK_DIRECTION catwalk-direction rtl)" # ltr or rtl
 FPS="$(catcfg CATWALK_FPS catwalk-fps 10)"
+# Target sixel canvas in pixels: exactly CATW x HEIGHT_ROWS terminal cells.
+TGT_W=$((CATW * CELLW))
+TGT_H=$((HEIGHT_ROWS * CELLH))
+FILL_OPTS=()
+COVER_OPTS=()
+if ((TGT_W > 0 && TGT_H > 0)); then
+    FILL_OPTS=()
+    COVER_OPTS=()
+fi
 # Background used for the GIF's transparent pixels (sixel has no alpha).
 # Konsole paints unpainted sixel pixels with canvas color #0, so the area
 # around the cat shows up as a colored slab unless we paint it ourselves.
@@ -83,7 +103,7 @@ fi
 KEY="$(md5sum "$GIF" 2>/dev/null | cut -d' ' -f1)-${CATW}x${HEIGHT_ROWS}"
 [[ -n "$BG" ]] && KEY="${KEY}-${BG#\#}"
 # bump when the sixel post-processing changes so cached frames re-render
-KEY="${KEY}-f1"
+KEY="${KEY}-f5-${CELLW}x${CELLH}-p${TOPPAD}"
 SIX_DIR="$CACHE/$KEY"
 mkdir -p "$SIX_DIR"
 
@@ -97,7 +117,7 @@ done
 if ! ls "$SIX_DIR"/f*.png >/dev/null 2>&1; then
     rm -rf "$SIX_DIR"
     mkdir -p "$SIX_DIR"
-    ffmpeg -y -loglevel error -i "$GIF" "$SIX_DIR/f%03d.png" 2>/dev/null || true
+    ffmpeg -y -loglevel error -i "$GIF" -vf "scale=${TGT_W}:${TGT_H}" "$SIX_DIR/f%03d.png" 2>/dev/null || true
 fi
 
 mapfile -t PNGS < <(ls -1 "$SIX_DIR"/f*.png 2>/dev/null | sort)
@@ -109,7 +129,7 @@ render_sixel() {
     local png="$1" out="$2" bg_opt=() filled
     [[ -n "$BG" ]] && bg_opt=(--bg="$BG")
     if [[ ! -f "$out" ]]; then
-        chafa --format=sixel --size="${CATW}x${HEIGHT_ROWS}" "${bg_opt[@]}" "$png" >"$out" 2>/dev/null || {
+        chafa --format=sixel --size="${CATW}x${HEIGHT_ROWS}" --exact-size=on "${bg_opt[@]}" "$png" >"$out" 2>/dev/null || {
             rm -f "$out"
             return 1
         }
@@ -118,7 +138,15 @@ render_sixel() {
         if [[ "${#BGR_BGR[@]}" -eq 3 ]]; then
             filled="${out}.filled"
             if python3 "$SCRIPT_DIR/sixelfill.py" "$out" "$filled" \
-                "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" 2>/dev/null; then
+                "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" \
+                "${FILL_OPTS[@]}" 2>/dev/null; then
+                mv -f "$filled" "$out"
+            else
+                rm -f "$filled"
+            fi
+        else
+            filled="${out}.filled"
+            if python3 "$SCRIPT_DIR/sixelfill.py" norm "$out" "$filled" 2>/dev/null; then
                 mv -f "$filled" "$out"
             else
                 rm -f "$filled"
@@ -134,24 +162,55 @@ for png in "${PNGS[@]}"; do
     SIX+=("$out")
 done
 
+# One opaque background-colored rectangle (same size as a frame) used to erase
+# the previous cat. Newer sixel placements draw on top of older ones on Konsole
+# (KDE bug 456354), so a cover drawn over the old position hides the previous
+# frame and only the newest cat stays visible; every older cover is the
+# terminal background color and therefore invisible.
+COVER=""
+if [[ "${#BGR_BGR[@]}" -eq 3 && -n "${SIX[0]}" && -f "${SIX[0]}" ]]; then
+    COVER="$SIX_DIR/cover.six"
+    if [[ ! -f "$COVER" ]]; then
+        python3 "$SCRIPT_DIR/sixelfill.py" cover "${SIX[0]}" "$COVER" \
+            "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" \
+            "${COVER_OPTS[@]}" 2>/dev/null || COVER=""
+    fi
+fi
+
 # walk width in cells
 MAXX=1
+PANEW=1
 update_maxx() {
-    local PANEW
     PANEW="$(tmux display -p -t "${TMUX_PANE:-}" '#{pane_width}' 2>/dev/null)"
-    [[ -z "$PANEW" ]] && PANEW="$(stty size | awk '{print $2}')"
+    [[ -z "$PANEW" || ! "$PANEW" =~ ^[0-9]+$ ]] && PANEW="$(stty size | awk '{print $2}')"
+    [[ -z "$PANEW" || ! "$PANEW" =~ ^[0-9]+$ ]] && PANEW=1
     MAXX=$((PANEW - CATW))
     ((MAXX < 1)) && MAXX=1
 }
 
-# paint the whole strip with spaces to overwrite the sixel pixels. On Konsole
+# Bottom-row placement: position the cat as low as possible without triggering
+# tmux's sixel scroll (screen-write.c:2925 scrolls if the image reaches the
+# last row).  ROW is the 1-indexed cursor row.
+PANEH=1
+ROW=1
+update_row() {
+    PANEH="$(tmux display -p -t "${TMUX_PANE:-}" '#{pane_height}' 2>/dev/null)"
+    [[ -z "$PANEH" || ! "$PANEH" =~ ^[0-9]+$ ]] && PANEH=1
+    local eff="$HEIGHT_ROWS"
+    ((eff > PANEH - 1)) && eff=$((PANEH - 1))
+    ROW=$((PANEH - eff))
+    ((ROW < 1)) && ROW=1
+}
+
+# paint the entire pane with spaces to overwrite the sixel pixels. On Konsole
 # glyph overwrites don't erase sixels (KDE bug 456354), so the watchdog
 # discards the graphics layer after this cat dies.
 cleanup() {
+    printf '\033Ptmux;\033\033[?1049l\033[?1049h\033\\'
     printf '\033[1;1H'
     local row
-    for ((row = 0; row < HEIGHT_ROWS; row++)); do
-        printf '%*s\n' "$((MAXX + CATW))" ""
+    for ((row = 0; row < PANEH; row++)); do
+        printf '%*s\n' "$((PANEW))" ""
     done
     printf '\033[?25h'
     exit 0
@@ -159,27 +218,72 @@ cleanup() {
 trap cleanup INT TERM HUP EXIT
 printf '\033[?25l'
 update_maxx
-trap 'update_maxx' WINCH
+update_row
+trap 'update_maxx; update_row' WINCH
+
+# Generate a full-pane background sixel to paint the entire pane in the
+# terminal background color.  The cat draws on top of this; the cover strip
+# (same size as a frame) erases the old cat position with the same color.
+BG_SIX="$SIX_DIR/bg.six"
+if [[ ! -f "$BG_SIX" && "${#BGR_BGR[@]}" -eq 3 ]]; then
+    PANEW_PX=$((PANEW * CELLW))
+    PANEH_PX=$((PANEH * CELLH))
+    NBANDS=$(( (PANEH_PX + 5) / 6 ))
+    {
+        printf '\033Pq"1;1;%d;%d#0;2;%d;%d;%d' \
+            "$PANEW_PX" "$PANEH_PX" \
+            "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}"
+        for ((b = 0; b < NBANDS; b++)); do
+            ((b > 0)) && printf '-'
+            printf '#0!%d~$' "$PANEW_PX"
+        done
+        printf '\033\\'
+    } > "$BG_SIX"
+fi
+
+# Place the full-pane background once before the animation loop.
+if [[ -f "$BG_SIX" ]]; then
+    printf '\033[1;1H'
+    cat "$BG_SIX" 2>/dev/null
+fi
 
 idx=0
-x=0
+if [[ "$DIRECTION" == "rtl" ]]; then
+    x=$MAXX
+else
+    x=0
+fi
 tick=0
+prev_x=-1
 while :; do
     # If our tmux server is gone (kill-server) we are orphaned - bow out
     # gracefully so we don't leak. The watchdog clears residue, then exits.
     if ((tick++ % 20 == 0)); then
         tmux has-session >/dev/null 2>&1 || break
     fi
-    # full clear + home, so tmux forgets the previous image
-    printf '\033[2J\033[1;1H'
-    printf '\033[1;%dH' "$((x + 1))"
+    # Without a cover, a full clear is the only way to erase the old image.
+    if [[ -z "$COVER" || ! -f "$COVER" ]]; then
+        printf "\033[2J\033[%d;1H" "$ROW"
+    fi
+    # cover the previous position so no stale cat remains on screen
+    if ((prev_x >= 0)) && [[ -n "$COVER" && -f "$COVER" ]]; then
+        printf "\033[%d;%dH" "$ROW" "$((prev_x + 1))"
+        cat "$COVER" 2>/dev/null
+    fi
+    printf "\033[%d;%dH" "$ROW" "$((x + 1))"
     if [[ -f "${SIX[$idx]}" ]]; then
         cat "${SIX[$idx]}" 2>/dev/null
     else
         cat "${SIX[0]}" 2>/dev/null
     fi
-    x=$((x + STEP))
-    ((x > MAXX)) && x=0
+    prev_x=$x
+    if [[ "$DIRECTION" == "rtl" ]]; then
+        x=$((x - STEP))
+        ((x < 0)) && x=$MAXX
+    else
+        x=$((x + STEP))
+        ((x > MAXX)) && x=0
+    fi
     idx=$(((idx + 1) % N))
     sleep "$FRAME_DELAY"
 done

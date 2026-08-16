@@ -17,6 +17,8 @@ if [[ "$state" == "1" ]]; then
     tmux list-panes -a -F '#{pane_id}|#{pane_start_command}' 2>/dev/null \
         | awk -F'|' '/catwalk/ {print $1}' \
         | while read -r pane; do
+            tmux send-keys -t "$pane" C-c 2>/dev/null || true
+            sleep 0.15
             tmux kill-pane -t "$pane" 2>/dev/null || true
           done
 else

@@ -1,23 +1,7 @@
 #!/usr/bin/env bash
-# catclear - discard the terminal's sixel graphics layer. Konsole keeps sixel
-# pixels after the pane that drew them is gone (KDE bug 456354) because glyph
-# overwrites don't erase them; toggling the alternate screen forces a discard.
-# A lock dedupes concurrent watchdogs (several cats dying at once) so the
-# popup only flashes once.
+# catclear - formerly discarded Konsole's sixel layer via a display-popup.
+# That responsibility now lives in catwalk's cleanup() trap, which sends
+# the alt-screen toggle while the pane's pty is still alive.  This script
+# is kept as a no-op so the watchdog→catclear chain still works.
 
-set -uo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=helpers.sh
-. "$SCRIPT_DIR/helpers.sh"
-
-CACHE="$(catcache)"
-mkdir -p "$CACHE"
-LOCK="$CACHE/.catclear.lock"
-
-if mkdir "$LOCK" 2>/dev/null; then
-    # release the lock a moment later; meanwhile other watchdogs skip
-    ( sleep 2; rmdir "$LOCK" 2>/dev/null ) &
-    sleep 0.15
-    tmux display-popup -E 'printf "\033Ptmux;\033\033[?1049l\033[?1049h\033\\"' 2>/dev/null || true
-fi
+exit 0
