@@ -206,7 +206,7 @@ update_row() {
 # glyph overwrites don't erase sixels (KDE bug 456354), so the watchdog
 # discards the graphics layer after this cat dies.
 cleanup() {
-    printf '\033Ptmux;\033\033[?1049l\033[?1049h\033\\'
+    printf '\033Ptmux;\033\033[2J\033[H\033\\'
     printf '\033[1;1H'
     local row
     for ((row = 0; row < PANEH; row++)); do

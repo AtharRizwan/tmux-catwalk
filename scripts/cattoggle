@@ -18,9 +18,9 @@ if [[ "$state" == "1" ]]; then
         | awk -F'|' '/catwalk/ {print $1}' \
         | while read -r pane; do
             tmux send-keys -t "$pane" C-c 2>/dev/null || true
-            sleep 0.15
             tmux kill-pane -t "$pane" 2>/dev/null || true
           done
+    tmux refresh-client 2>/dev/null || true
 else
     tmux set-option -g @cats-on 1
     "$SCRIPT_DIR/catensure-all"
