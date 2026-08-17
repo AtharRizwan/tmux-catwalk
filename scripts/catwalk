@@ -261,6 +261,7 @@ while :; do
     if ((tick++ % 20 == 0)); then
         tmux has-session >/dev/null 2>&1 || break
     fi
+    [[ -n "$WIN_ID" ]] && (( $(tmux list-panes -t "$WIN_ID" 2>/dev/null | wc -l) <= 1 )) && break
     # Without a cover, a full clear is the only way to erase the old image.
     if [[ -z "$COVER" || ! -f "$COVER" ]]; then
         printf "\033[2J\033[%d;1H" "$ROW"

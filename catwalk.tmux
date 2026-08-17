@@ -45,18 +45,6 @@ if ! tmux show-options -gv @resurrect-hook-post-restore-all >/dev/null 2>&1; the
         "tmux run-shell '$SCRIPTS/catensure-all --restored'"
 fi
 
-# Auto-close the catwalk pane when it is the last pane in its window.
-tmux set-hook -g after-kill-pane "run-shell '
-  WIN=\$(tmux display -p #{window_id});
-  if tmux list-panes -t \$WIN -F #{pane_start_command} 2>/dev/null | grep -q catwalk;
-  then
-    if [ \"\$(tmux list-panes -t \$WIN 2>/dev/null | wc -l)\" -le 1 ];
-    then
-      tmux kill-pane -t \$WIN 2>/dev/null;
-    fi;
-  fi
-'"
-
 BIND="$(tmux show-options -gv @catwalk-bind 2>/dev/null || echo C)"
 tmux bind-key "$BIND" run-shell "$SCRIPTS/cattoggle"
 
