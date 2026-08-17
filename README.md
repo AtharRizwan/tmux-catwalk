@@ -15,10 +15,16 @@ WezTerm, plus tmux >= 3.2).
 ## Install (tpm)
 
 ```tmux
-set -g @plugin 'tmux-plugins/tmux-catwalk'   # or a local path, e.g. '~/.config/tmux/plugins/tmux-catwalk'
+set -g @plugin 'AtharRizwan/tmux-catwalk'
 ```
 
 press `prefix + I`.
+
+Then set your walking cat GIF (required):
+
+```tmux
+set -g @catwalk-gif '~/Pictures/walking-cat.gif'
+```
 
 ## Options
 
@@ -30,7 +36,7 @@ press `prefix + I`.
 | `@catwalk-cell-ratio`  | `2.4`                                      | terminal cell height/width used when deriving width (8x16 fonts ~2.0)               |
 | `@catwalk-fps`         | `10`                                       | animation frames per second                                                         |
 | `@catwalk-step`        | `1`                                        | cells the cat advances per tick                                                     |
-| `@catwalk-gif`         | bundled `cat.gif`                          | path to a walking-cat GIF                                                           |
+| `@catwalk-gif`         | **(required)**                             | path to a walking-cat GIF                                                           |
 | `@catwalk-bind`        | `C`                                        | prefix key to toggle cats                                                           |
 | `@catwalk-bg`          | _(auto)_                                   | background for the GIF's transparent pixels; empty = detect terminal bg, hex overrides |
 | `@catwalk-cache-dir`   | `${XDG_CACHE_HOME:-~/.cache}/tmux-catwalk` | sixel render cache                                                                  |
@@ -68,3 +74,13 @@ terminal's own background. Set `@catwalk-bg` to a hex color (e.g.
 - Each `catwalk` spawns a detached `catwatchdog`; when the cat dies for any
   reason the watchdog toggles the alternate screen via a tiny popup, which
   makes the terminal discard the sixel graphics layer.
+
+## Troubleshooting
+
+- **No cat appears**: ensure `@catwalk-gif` points to a valid GIF file and
+  your terminal supports sixel (`terminal-features` must include `sixel`).
+- **Ghost pixels after toggle**: this is Konsole bug 456354. The watchdog
+  clears the sixel layer automatically; if it persists, try `prefix + C`
+  again or `tmux run-shell ~/.config/tmux/plugins/tmux-catwalk/scripts/catclear`.
+- **Cat looks stretched/squished**: tune `@catwalk-cell-ratio` to match your
+  font's cell dimensions (measure a character in pixels).

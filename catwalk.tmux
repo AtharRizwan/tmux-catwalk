@@ -21,7 +21,7 @@ default catwalk-cell-ratio 2.4
 default catwalk-fps 10
 default catwalk-step 1
 default catwalk-direction rtl
-default catwalk-gif "$CURRENT_DIR/cat.gif"
+default catwalk-gif ""
 default catwalk-bind C
 default catwalk-cache-dir "${XDG_CACHE_HOME:-$HOME/.cache}/tmux-catwalk"
 default catwalk-sixel-check 1
