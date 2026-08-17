@@ -49,8 +49,8 @@ TGT_H=$((HEIGHT_ROWS * CELLH))
 FILL_OPTS=()
 COVER_OPTS=()
 if ((TGT_W > 0 && TGT_H > 0)); then
-    FILL_OPTS=()
-    COVER_OPTS=()
+    FILL_OPTS=("--target" "${TGT_W}x${TGT_H}")
+    COVER_OPTS=("--target" "${TGT_W}x${TGT_H}")
 fi
 # Background used for the GIF's transparent pixels (sixel has no alpha).
 # Konsole paints unpainted sixel pixels with canvas color #0, so the area
