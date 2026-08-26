@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# catkill - kill every catwalk pane. Shared by cattoggle and by the
+# tmux-resurrect pre-save hook (cats must not end up in the save file: resurrect
+# brings panes back as plain shells, so a saved cat would return as an empty
+# strip and catensure would add a second, real one beside it).
+#
+# Each pane's own exit trap discards the terminal's sixel graphics layer.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=helpers.sh
+. "$SCRIPT_DIR/helpers.sh"
+
+while read -r pane; do
+    [[ -n "$pane" ]] || continue
+    tmux kill-pane -t "$pane" 2>/dev/null || true
+done < <(catpanes)
+
+tmux refresh-client 2>/dev/null || true

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# catsave <state-file> - tmux-resurrect post-save-layout hook.
+#
+# resurrect saves the cat panes along with every other pane, and brings them
+# back as plain shells: it recreates panes, it does not re-run their commands.
+# Left alone that leaves one dead strip per window per restore, and the strips
+# accumulate because the next save records them too.
+#
+# resurrect has no pre-save hook, and killing the cats mid-save is not an option
+# either - the layout would reflow under the user's hands every time continuum
+# fires. So instead of fighting the save we record where the cats were;
+# `catensure-all --restored` reclaims exactly those panes afterwards, which also
+# keeps the restored layout identical to the saved one.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=helpers.sh
+. "$SCRIPT_DIR/helpers.sh"
+
+STATE="${1:-}"
+[[ -n "$STATE" && -f "$STATE" ]] || exit 0
+
+# Height is recorded so the reclaim can refuse to respawn into a pane that is
+# not the strip we saved.
+if ! tmux list-panes -a -f '#{@catwalk}' \
+    -F '#{session_name}	#{window_index}	#{pane_index}	#{pane_height}' \
+    >"$STATE.catwalk" 2>/dev/null; then
+    rm -f "$STATE.catwalk"
+    exit 0
+fi
+[[ -s "$STATE.catwalk" ]] || rm -f "$STATE.catwalk"
+
+# Drop sidecars whose state file resurrect has since pruned.
+for side in "$(dirname "$STATE")"/*.catwalk; do
+    [[ -f "$side" ]] || continue
+    [[ -f "${side%.catwalk}" ]] || rm -f "$side"
+done
+exit 0

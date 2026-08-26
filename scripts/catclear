@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# catclear - formerly discarded Konsole's sixel layer via a display-popup.
-# That responsibility now lives in catwalk's cleanup() trap, which sends
-# the alt-screen toggle while the pane's pty is still alive.  This script
-# is kept as a no-op so the watchdog→catclear chain still works.
-
-exit 0

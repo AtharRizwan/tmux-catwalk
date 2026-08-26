@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # cattoggle - flip the global @cats-on master switch.
 #   ON:  ensure a cat in every window.
-#   OFF: kill every catwalk pane; each one's watchdog discards the sixel
-#        graphics layer (no popup needed here).
+#   OFF: kill every catwalk pane.
 
 set -uo pipefail
 
@@ -10,17 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=helpers.sh
 . "$SCRIPT_DIR/helpers.sh"
 
-state="$(catopt cats-on 1)"
-
-if [[ "$state" == "1" ]]; then
+if [[ "$(catopt cats-on 1)" == "1" ]]; then
     tmux set-option -g @cats-on 0
-    tmux list-panes -a -F '#{pane_id}|#{pane_start_command}' 2>/dev/null \
-        | awk -F'|' '/catwalk/ {print $1}' \
-        | while read -r pane; do
-            tmux send-keys -t "$pane" C-c 2>/dev/null || true
-            tmux kill-pane -t "$pane" 2>/dev/null || true
-          done
-    tmux refresh-client 2>/dev/null || true
+    "$SCRIPT_DIR/catkill"
 else
     tmux set-option -g @cats-on 1
     "$SCRIPT_DIR/catensure-all"

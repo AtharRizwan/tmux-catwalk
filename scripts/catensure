@@ -19,11 +19,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Respect the master switch
 [[ "$(catopt cats-on 1)" == "1" ]] || exit 0
 
-# Sanity gate: spawning only makes sense if sixel passthrough is configured.
+# Sanity gate: spawning only makes sense if the client can draw sixels.
 if [[ "$(catopt catwalk-sixel-check 1)" == "1" ]]; then
-    if ! tmux show-options -gv terminal-features 2>/dev/null | grep -q sixel; then
-        exit 0
-    fi
+    catsixel_ok || exit 0
+fi
+
+# A missing GIF used to spawn a pane that printed to itself and vanished a
+# second later - a flash with no diagnostic, which is the single most likely
+# way to misconfigure this plugin. Say so once, in the status line, instead.
+GIF="$(catgif)"
+if [[ -z "$GIF" ]]; then
+    tmux display-message "tmux-catwalk: @catwalk-gif is not set" 2>/dev/null
+    exit 0
+fi
+if [[ ! -f "$GIF" ]]; then
+    tmux display-message "tmux-catwalk: no cat image at $GIF" 2>/dev/null
+    exit 0
 fi
 
 WIN="${1:-}"
@@ -36,18 +47,23 @@ if [[ -z "$WIN" ]]; then
 fi
 [[ -n "$WIN" ]] || exit 0
 
-# One cat per window, never a double.
-if tmux list-panes -t "$WIN" -F '#{pane_start_command}' 2>/dev/null | grep -q catwalk; then
-    exit 0
-fi
+# One cat per window, never a double. Cats are identified by the @catwalk pane
+# option they stamp on themselves, not by a substring of the start command.
+catwin_has_cat "$WIN" && exit 0
 
 HEIGHT="$(catcfg CATWALK_HEIGHT catwalk-height 3)"
+[[ "$HEIGHT" =~ ^[0-9]+$ ]] && ((HEIGHT > 0)) || HEIGHT=3
 
 # Width is left to the catwalk script: it derives its own columns from the
 # height + GIF aspect (or honors @catwalk-width) so no env is forced here.
 # Pane is HEIGHT+1 rows so tmux's sixel clip (screen_size_y-1) has room and
 # the full cat image is visible.
 PANE_HEIGHT=$((HEIGHT + 1))
-tmux split-window -t "$WIN" -d -f -b -l "$PANE_HEIGHT" \
-    -e "CATWALK_HEIGHT=$HEIGHT" \
-    "$SCRIPT_DIR/catwalk" 2>/dev/null
+# -P/-F hands back the new pane id so the @catwalk stamp lands immediately.
+# Leaving the stamp to the catwalk process itself opened a window in which a
+# second catensure pass saw no cat and split another pane in beside the first.
+NEW_PANE="$(tmux split-window -t "$WIN" -d -f -b -l "$PANE_HEIGHT" \
+    -e "CATWALK_HEIGHT=$HEIGHT" -P -F '#{pane_id}' \
+    "$SCRIPT_DIR/catwalk" 2>/dev/null)"
+[[ -n "$NEW_PANE" ]] && tmux set-option -p -t "$NEW_PANE" @catwalk 1 2>/dev/null
+exit 0

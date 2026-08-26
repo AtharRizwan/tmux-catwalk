@@ -3,10 +3,10 @@
 # pass used by the hooks, after plugin load on a running server, and after a
 # resurrect restore.
 #
-# While a resurrect restore is in progress, restored windows are still being
-# populated with their saved layouts (which include saved catwalk panes).
-# Spawning then would create an extra pane, so we defer; the resurrect
-# post-restore-all hook re-runs this with --restored once the restore finished.
+# While a resurrect restore is in progress, windows are still being populated
+# from the saved layout. Spawning then would race the restore, so we defer; the
+# resurrect post-restore-all hook re-runs this with --restored once the restore
+# has finished.
 
 set -uo pipefail
 
@@ -16,12 +16,53 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 [[ "$(catopt cats-on 1)" == "1" ]] || exit 0
 
-if [[ "${1:-}" != "--restored" ]]; then
+RESTORED=0
+if [[ "${1:-}" == "--restored" ]]; then
+    RESTORED=1
+else
     # defer while tmux-resurrect is actively restoring
     if pgrep -f '[t]mux-resurrect/scripts/restore\.sh' >/dev/null 2>&1; then
         exit 0
     fi
 fi
+
+# reclaim_restored_cats - turn the strips resurrect just brought back into real
+# cats again, instead of leaving them as dead panes and splitting a second one
+# in beside them. The panes to reclaim are the ones catsave recorded next to the
+# state file, so this is an exact lookup rather than a guess - and each candidate
+# is re-checked against the geometry we saved before anything is respawned.
+reclaim_restored_cats() {
+    local dir state sidecar sess win idx h target geom pw ww ptop ph pcat
+    dir="$(catresurrect_dir)"
+    [[ -n "$dir" && -d "$dir" ]] || return 0
+    state="$(readlink -f "$dir/last" 2>/dev/null)"
+    [[ -n "$state" && -f "$state" ]] || return 0
+    sidecar="$state.catwalk"
+    [[ -f "$sidecar" ]] || return 0
+
+    while IFS=$'\t' read -r sess win idx h; do
+        [[ -n "$sess" && -n "$win" && -n "$idx" ]] || continue
+        target="$sess:$win.$idx"
+        geom="$(tmux display -p -t "$target" \
+            '#{pane_width} #{window_width} #{pane_top} #{pane_height} [#{@catwalk}]' 2>/dev/null)"
+        [[ -n "$geom" ]] || continue
+        read -r pw ww ptop ph pcat <<< "$geom"
+        [[ "$pcat" == "[1]" ]] && continue      # already walking
+        [[ "$pw" == "$ww" ]] || continue        # a cat strip is full width
+        [[ "$ptop" == "0" ]] || continue        # ... and flush with the top
+        [[ -z "$h" || "$ph" == "$h" ]] || continue
+        # Stamp first: the ensure pass below must see this pane as a cat
+        # even before the respawned catwalk has started up.
+        tmux set-option -p -t "$target" @catwalk 1 2>/dev/null
+        if ! tmux respawn-pane -k -t "$target" \
+            -e "CATWALK_HEIGHT=$(catcfg CATWALK_HEIGHT catwalk-height 3)" \
+            "$SCRIPT_DIR/catwalk" 2>/dev/null; then
+            tmux set-option -pu -t "$target" @catwalk 2>/dev/null
+        fi
+    done < "$sidecar"
+}
+
+((RESTORED)) && reclaim_restored_cats
 
 while read -r win; do
     [[ -z "$win" ]] && continue

@@ -18,6 +18,10 @@
 # headroom above the cat's head (the same number of content bands are trimmed
 # from the bottom only if the content would otherwise overflow the canvas).
 #
+# Every mode also strips chafa's own cursor-visibility sequences. catwalk hides
+# the cursor once for the whole animation; a trailing ESC[?25h on each frame
+# turned it back on at the frame rate.
+#
 # Usage:
 #   sixelfill.py [fill] IN OUT R G B [--top-pad N] [--target WxH]
 #     R G B   background color as 0-100 sixel channel values
@@ -32,6 +36,10 @@
 
 import re
 import sys
+
+# Sixel color registers are indexed 0-255; there is nowhere to put a fill color
+# if a stream has genuinely claimed every one of them.
+MAX_PEN = 255
 
 
 def read_stream(path):
@@ -48,8 +56,11 @@ def read_stream(path):
     if mh:
         pre = pre[:mh.start()] + b'\x1bPq'
     post = data[m.end(1):]
-    if not post:
-        post = b'\x1b\\\x1b[?25h'
+    # Drop cursor show/hide either side of the image; catwalk owns the cursor.
+    pre = pre.replace(b'\x1b[?25l', b'').replace(b'\x1b[?25h', b'')
+    post = post.replace(b'\x1b[?25h', b'').replace(b'\x1b[?25l', b'')
+    if not post.startswith(b'\x1b\\'):
+        post = b'\x1b\\' + post
     return pre, payload, post
 
 
@@ -64,6 +75,27 @@ def canvas_rewrite(payload, width, height):
     return re.sub(r'"1;1;\d+;\d+', '"1;1;%d;%d' % (width, height), payload, count=1)
 
 
+def split_palette(payload):
+    """Return (head, palette, stream, pen) for a chafa payload.
+
+    `pen` is a color register that no color definition anywhere in the payload
+    uses, so the fill color can be registered without clobbering one of the
+    image's own colors. Deriving it from the *leading* run of definitions, as
+    this used to, would collide with any definition emitted mid-stream.
+    """
+    i = payload.index('#')
+    pat = re.compile(r'#(\d+);2;(\d+);(\d+);(\d+)')
+    j = i
+    while True:
+        mm = pat.match(payload[j:])
+        if not mm:
+            break
+        j += len(mm.group(0))
+    used = [int(g) for g in re.findall(r'#(\d+);2;', payload)]
+    pen = min(max(used) + 1, MAX_PEN) if used else 0
+    return payload[:i], payload[i:j], payload[j:], pen
+
+
 def fill(path_in, path_out, r, g, b, top_pad=0, tw=0, th=0):
     sp = read_stream(path_in)
     if not sp:
@@ -76,18 +108,7 @@ def fill(path_in, path_out, r, g, b, top_pad=0, tw=0, th=0):
         width, height = tw, th
         payload = canvas_rewrite(payload, width, height)
 
-    i = payload.index('#')
-    pat = re.compile(r'#(\d+);2;(\d+);(\d+);(\d+)')
-    j = i
-    pen = 0  # number of registered colors; first free index
-    while True:
-        mm = pat.match(payload[j:])
-        if not mm:
-            break
-        pen += 1
-        j += len(mm.group(0))
-    palette = payload[i:j]
-    stream = payload[j:]
+    head, palette, stream, pen = split_palette(payload)
 
     nbands = (height + 5) // 6
     pieces = stream.split('-')
@@ -112,7 +133,7 @@ def fill(path_in, path_out, r, g, b, top_pad=0, tw=0, th=0):
     else:
         out = fillband
 
-    out = payload[:i] + palette + '#%d;2;%d;%d;%d' % (pen, r, g, b) + out
+    out = head + palette + '#%d;2;%d;%d;%d' % (pen, r, g, b) + out
 
     open(path_out, 'wb').write(pre + out.encode('latin1') + post)
     return True

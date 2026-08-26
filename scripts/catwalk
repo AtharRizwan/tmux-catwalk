@@ -3,8 +3,8 @@
 # real images via the Sixel graphics protocol (Konsole + tmux >= 3.2).
 #
 # Sizing/animation are driven by tmux options (@catwalk-*) or env overrides
-# (CATWALK_*). A watchdog is spawned so the terminal's sixel graphics layer
-# gets discarded however this cat dies.
+# (CATWALK_*). The exit trap discards the terminal's sixel graphics layer, so
+# no ghost pixels survive however this cat dies.
 
 set -uo pipefail
 
@@ -12,27 +12,62 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=helpers.sh
 . "$SCRIPT_DIR/helpers.sh"
 
-GIF="$(catcfg CATWALK_GIF catwalk-gif "$CATWALK_PLUGIN_DIR/cat.gif")"
+die() {
+    printf 'tmux-catwalk: %s\n' "$*" >&2
+    tmux display-message "tmux-catwalk: $*" 2>/dev/null
+    sleep 1
+    exit 1
+}
+
+GIF="$(catgif)"
 CACHE="$(catcache)"
+
+# --- sizing -----------------------------------------------------------------
 HEIGHT_ROWS="$(catcfg CATWALK_HEIGHT catwalk-height 3)" # rows the cat occupies
-# Terminal cell size in pixels (11x26 for this Konsole). The sixel canvas is
-# normalized to CATW x HEIGHT_ROWS of these cells so the cat always fills the
-# same number of rows regardless of chafa's own cell geometry.
-CELLPX="$(catcfg CATWALK_CELL_PX catwalk-cell-px '11x26')"
-CELLW="${CELLPX%[xX]*}"
-CELLH="${CELLPX#*[xX]}"
-[[ "$CELLW" =~ ^[0-9]+$ && "$CELLH" =~ ^[0-9]+$ ]] || { CELLW=11; CELLH=26; }
+[[ "$HEIGHT_ROWS" =~ ^[0-9]+$ ]] && ((HEIGHT_ROWS > 0)) || HEIGHT_ROWS=3
+# Terminal cell size in pixels. The sixel canvas is normalized to
+# CATW x HEIGHT_ROWS of these cells so the cat always fills the same number of
+# rows regardless of chafa's own cell geometry.
+#
+# This has to be the *window's* cell size rather than the terminal's -- see
+# catwincell in helpers.sh. A window that tmux still thinks has 16x32 cells
+# measured our 11x26-based canvas as 7 columns instead of 9 and drew the cat a
+# fifth too narrow; baking to whatever that window believes puts it back on
+# exactly CATW x HEIGHT_ROWS cells there too. An explicit @catwalk-cell-px still
+# wins, and pins the size (no re-render on resize).
+CELL_AUTO=0
+CELLPX="$(catcfg CATWALK_CELL_PX catwalk-cell-px auto)"
+if [[ ! "$CELLPX" =~ ^[0-9]+[xX][0-9]+$ ]]; then
+    CELL_AUTO=1
+    CELLPX="$(catwincell "${TMUX_PANE:-}")"
+fi
+CELLW="${CELLPX%%[xX]*}"
+CELLH="${CELLPX##*[xX]}"
+[[ "$CELLW" =~ ^[0-9]+$ && "$CELLH" =~ ^[0-9]+$ ]] && ((CELLW > 0 && CELLH > 0)) || { CELLW=11; CELLH=26; }
 # 6px bands of headroom to add above the cat's head (shifts the cat down).
 TOPPAD="$(catcfg CATWALK_TOP_PAD catwalk-top-pad 1)"
 [[ "$TOPPAD" =~ ^[0-9]+$ ]] || TOPPAD=1
 # Width in columns: an explicit @catwalk-width / CATWALK_WIDTH wins; otherwise
 # derive it from @catwalk-height and the GIF's own proportions so the cat stays
-# proportionate at any height. RATIO approximates a terminal cell's height/width
-# (8x16 fonts ~2.0, this Konsole ~2.4); tune @catwalk-cell-ratio if the cat
-# looks squished or skinny.
+# proportionate at any height. RATIO is a terminal cell's height/width (8x16
+# fonts 2.0, this Konsole 26/11); tune @catwalk-cell-ratio if the cat looks
+# squished or skinny.
 CATW="$(catcfg CATWALK_WIDTH catwalk-width '')"
+if [[ -n "$CATW" ]] && { [[ ! "$CATW" =~ ^[0-9]+$ ]] || ((CATW < 1)); }; then
+    CATW=""
+fi
 if [[ -z "$CATW" ]]; then
-    RATIO="$(catcfg CATWALK_CELL_RATIO catwalk-cell-ratio 2.4)"
+    RATIO="$(catcfg CATWALK_CELL_RATIO catwalk-cell-ratio auto)"
+    if [[ ! "$RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        # Taken from the *client's* cell, deliberately unlike CELLPX above:
+        # RATIO decides CATW, and a cat that came out a different number of
+        # columns from one window to the next would be worse than one that is
+        # a little off. Every window has to agree on this, so it cannot come
+        # from the per-window value.
+        RATIO="$(awk -v p="$(catclientcell "${TMUX_PANE:-}")" \
+            'BEGIN{ n=split(p,a,/[xX]/); if (n==2 && a[1]>0 && a[2]>0) printf "%.4f", a[2]/a[1] }')"
+    fi
+    [[ "$RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$RATIO" != 0 ]] || RATIO=2.4
     IFS=, read -r GW GH < <(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$GIF" 2>/dev/null || true)
     if [[ "$GW" =~ ^[0-9]+$ && "$GH" =~ ^[0-9]+$ && "$GH" -gt 0 ]]; then
         CATW="$(awk -v h="$HEIGHT_ROWS" -v w="$GW" -v gh="$GH" -v r="$RATIO" 'BEGIN{ x=int(h*w*r/gh+0.5); print (x>0?x:1) }')"
@@ -40,18 +75,28 @@ if [[ -z "$CATW" ]]; then
         CATW="28"
     fi
 fi
+
+# --- animation --------------------------------------------------------------
 STEP="$(catcfg CATWALK_STEP catwalk-step 1)" # cells to advance per tick
+[[ "$STEP" =~ ^[0-9]+$ ]] && ((STEP > 0)) || STEP=1
 DIRECTION="$(catcfg CATWALK_DIRECTION catwalk-direction rtl)" # ltr or rtl
+[[ "$DIRECTION" == "ltr" || "$DIRECTION" == "rtl" ]] || DIRECTION=rtl
 FPS="$(catcfg CATWALK_FPS catwalk-fps 10)"
+# FPS divides into the frame period below, and a 0 (or a typo) there used to
+# leave the sleep argument empty, which failed instantly on every iteration and
+# turned the loop into an unthrottled busy spin. Validate before dividing.
+[[ "$FPS" =~ ^[0-9]+$ ]] && ((FPS > 0)) || FPS=10
+
 # Target sixel canvas in pixels: exactly CATW x HEIGHT_ROWS terminal cells.
 TGT_W=$((CATW * CELLW))
 TGT_H=$((HEIGHT_ROWS * CELLH))
-FILL_OPTS=()
+FILL_OPTS=("--top-pad" "$TOPPAD")
 COVER_OPTS=()
 if ((TGT_W > 0 && TGT_H > 0)); then
-    FILL_OPTS=("--target" "${TGT_W}x${TGT_H}")
+    FILL_OPTS+=("--target" "${TGT_W}x${TGT_H}")
     COVER_OPTS=("--target" "${TGT_W}x${TGT_H}")
 fi
+
 # Background used for the GIF's transparent pixels (sixel has no alpha).
 # Konsole paints unpainted sixel pixels with canvas color #0, so the area
 # around the cat shows up as a colored slab unless we paint it ourselves.
@@ -65,53 +110,146 @@ if [[ "$BG" =~ ^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$ ]]; then
         "$((16#${BASH_REMATCH[3]} * 100 / 255))"
     )
 fi
-require_cmd python3 || BGR_BGR=()
 
-die() {
-    printf 'tmux-catwalk: %s\n' "$*" >&2
-    sleep 1
-    exit 1
-}
-
+# --- dependencies -----------------------------------------------------------
 require_cmd ffmpeg || die "ffmpeg is required (gif frame extraction)"
+require_cmd ffprobe || die "ffprobe is required (gif aspect detection)"
 require_cmd chafa || die "chafa is required (sixel rendering)"
+require_cmd python3 || die "python3 is required (sixel post-processing)"
 require_cmd md5sum || die "md5sum is required"
 chafa --help 2>&1 | grep -q sixels || die "this chafa build has no sixel support"
+[[ -n "$GIF" ]] || die "@catwalk-gif is not set"
 [[ -f "$GIF" ]] || die "no cat image at $GIF (set @catwalk-gif)"
 
-# If another catwalk already occupies this window (e.g. spawned during a
-# resurrect restore), let it win.
-WIN_ID="$(tmux display -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null || true)"
-if [[ -n "$WIN_ID" ]]; then
-    COUNT="$(tmux list-panes -t "$WIN_ID" -F '#{pane_start_command}' 2>/dev/null | grep -c catwalk || true)"
-    ((COUNT > 1)) && exit 0
+# --- pane identity ----------------------------------------------------------
+# Stamp this pane so every other script can find its cats without pattern
+# matching #{pane_start_command} (which also matched, say, an editor opened on
+# this file - and cattoggle would then kill it).
+WIN_ID=""
+PANE_ID=""
+# Installed before anything else can take time: catpoke sends SIGUSR1, whose
+# default action would otherwise kill a cat that is still starting up.
+NEED_CHECK=0
+trap 'NEED_CHECK=1' USR1
+if [[ -n "${TMUX_PANE:-}" ]]; then
+    IFS=' ' read -r WIN_ID PANE_ID < <(tmux display -p -t "$TMUX_PANE" '#{window_id} #{pane_id}' 2>/dev/null || true)
+    if [[ -n "$PANE_ID" ]]; then
+        tmux set-option -p -t "$PANE_ID" @catwalk 1 2>/dev/null
+        # so catpoke can nudge us the instant the layout changes
+        tmux set-option -p -t "$PANE_ID" @catwalk-pid "$$" 2>/dev/null
+        # A zoomed pane is the only one tmux draws, so while something else is
+        # zoomed our output never reaches the terminal - including the escape
+        # that clears the sixels we already painted. Passthrough is a *pane*
+        # option, so we can grant ourselves the "even while invisible" level
+        # here without touching the global setting or any other pane.
+        tmux set-option -p -t "$PANE_ID" allow-passthrough all 2>/dev/null
+    fi
 fi
 
-FRAME_DELAY="$(awk -v f="$FPS" 'BEGIN{printf "%.3f", 1/f}')"
+# --- discarding what we painted ---------------------------------------------
+# Glyph and erase-display overwrites do not remove sixels on Konsole (KDE bug
+# 456354); cycling the alternate screen buffer does make it drop the graphics
+# layer. tmux is already *in* the alternate screen (the client's terminal has
+# smcup=\E[?1049h), so we leave it and come back: doing it the other way round
+# clears just the same but strands the terminal in the primary buffer, which
+# quietly clobbers pre-tmux scrollback and breaks screen restore on detach.
+# Every ESC in a tmux passthrough payload must be doubled, hence \033\033.
+# refresh-client then repaints tmux's own content over the blanked terminal.
+sixel_discard() {
+    printf '\033Ptmux;\033\033[?1049l\033\033[?1049h\033\\'
+    tmux refresh-client 2>/dev/null
+}
 
-# Watchdog clears the sixel layer if this cat dies by any means (kill-pane,
-# kill-window, kill-session, toggle-off, crash). setsid detaches it from the
-# pane's process group so pane teardown signals cannot reach it.
-if [[ -z "${CATWALK_NO_WATCHDOG:-}" ]]; then
-    setsid nohup "$SCRIPT_DIR/catwatchdog" "$$" \
-        </dev/null >/dev/null 2>&1 &
+# 1 while this cat's window is the visible one, and 1 while another pane in it
+# has been zoomed over us. Both are maintained by pane_alone_or_duplicate below.
+# Sixels belong to the terminal, not to the pane, so whenever tmux stops drawing
+# us the frame we last painted stays on the glass; these let us react to that.
+WIN_ACTIVE=1
+ZOOM_HIDDEN=0
+
+# pane_alone_or_duplicate - non-zero when this cat should bow out: either it is
+# the only pane left in the window (let the window close), or another cat pane
+# beat it here. Ties are broken deterministically on the pane id, so of two cats
+# racing into one window exactly one survives - never zero, never both.
+# It also refreshes our visibility, since the pane list is already in hand.
+pane_alone_or_duplicate() {
+    local -a panes=()
+    local p id wact zoom pact flag lowest="" hidden=0 wasact=$WIN_ACTIVE
+    mapfile -t panes < <(tmux list-panes -t "$WIN_ID" \
+        -F '#{pane_id} #{window_active} #{window_zoomed_flag} #{pane_active} #{@catwalk}' 2>/dev/null)
+    ((${#panes[@]} > 1)) || return 0
+    for p in "${panes[@]}"; do
+        read -r id wact zoom pact flag <<< "$p"
+        if [[ "$id" == "$PANE_ID" ]]; then
+            [[ "$wact" == "1" ]] && WIN_ACTIVE=1 || WIN_ACTIVE=0
+            # Zoom shows one pane and hides the rest; we are hidden by it unless
+            # we are the zoomed pane ourselves.
+            [[ "$wact" == "1" && "$zoom" == "1" && "$pact" != "1" ]] && hidden=1
+        fi
+        [[ "$flag" == "1" ]] || continue
+        if [[ -z "$lowest" ]] || ((${id#%} < ${lowest#%})); then
+            lowest="$id"
+        fi
+    done
+    # Just been zoomed away: nothing will paint over the frame we left on the
+    # terminal, so drop the whole sixel layer once, on the edge. Deliberately
+    # not done when the window merely goes to the background - that would flash
+    # on every window switch, and it is unnecessary there because the incoming
+    # window's cat is at the identical position and paints straight over us.
+    if ((hidden && !ZOOM_HIDDEN)); then
+        sixel_discard
+    fi
+    ZOOM_HIDDEN=$hidden
+    # Coming back to the foreground: repaint the strip over whatever was left.
+    if ((WIN_ACTIVE && !wasact)); then
+        NEED_BG=1
+    fi
+    [[ -z "$lowest" || "$lowest" == "$PANE_ID" ]] && return 1
+    return 0
+}
+
+if [[ -n "$WIN_ID" && -n "$PANE_ID" ]]; then
+    # let a simultaneously-spawned peer finish stamping itself first
+    sleep 0.2
+    pane_alone_or_duplicate && exit 0
 fi
 
-# Cache key includes render size and background color so changing
-# @catwalk-width/height or the terminal theme re-renders instead of reusing
-# stale frames.
+# Frame period in whole microseconds. Position and frame index are derived from
+# the wall clock divided by this, so every cat on the machine lands on the same
+# frame at the same instant no matter when it was started.
+FRAME_US=$((1000000 / FPS))
+((FRAME_US > 0)) || FRAME_US=100000
+
+# --- cache ------------------------------------------------------------------
+# Cache key includes render size, background color and top padding so changing
+# @catwalk-width/height, the terminal theme or the padding re-renders instead of
+# reusing stale frames.
 KEY="$(md5sum "$GIF" 2>/dev/null | cut -d' ' -f1)-${CATW}x${HEIGHT_ROWS}"
 [[ -n "$BG" ]] && KEY="${KEY}-${BG#\#}"
 # bump when the sixel post-processing changes so cached frames re-render
-KEY="${KEY}-f5-${CELLW}x${CELLH}-p${TOPPAD}"
+KEY="${KEY}-f7-${CELLW}x${CELLH}-p${TOPPAD}"
 SIX_DIR="$CACHE/$KEY"
-mkdir -p "$SIX_DIR"
+mkdir -p "$SIX_DIR" || die "cannot create cache dir $SIX_DIR"
 
-# prune stale cache dirs
-for old in "$CACHE"/*; do
-    [[ "$old" == "$SIX_DIR" ]] && continue
-    [[ -d "$old" ]] && rm -rf "$old"
-done
+# Every window's cat starts at once and they all share this cache directory, so
+# populating it has to be serialised: otherwise one cat's `rm -rf` lands in the
+# middle of another's ffmpeg run, and half-written .six files get catted
+# straight to the terminal.
+LOCK_FD=""
+if require_cmd flock; then
+    exec 9>"$CACHE/.lock" && LOCK_FD=9
+    [[ -n "$LOCK_FD" ]] && flock 9 2>/dev/null
+fi
+
+# Prune stale cache dirs by age, not by "everything that is not mine". The key
+# includes the cell geometry, and two windows can legitimately disagree about
+# what a cell is (see CELLPX above), so each would have wiped the other's frames
+# on every pass -- an endless ffmpeg/chafa loop between two live cats. Touching
+# our own dir on each start is what keeps it out of the sweep.
+touch "$SIX_DIR" 2>/dev/null
+if [[ -n "$CACHE" && -d "$CACHE" ]] && require_cmd find; then
+    find "$CACHE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null
+fi
 
 # extract frames once
 if ! ls "$SIX_DIR"/f*.png >/dev/null 2>&1; then
@@ -125,34 +263,38 @@ N="${#PNGS[@]}"
 ((N > 0)) || die "could not extract frames from $GIF"
 
 # Pre-render every frame to sixel. Fail loudly instead of silently blanking.
+# The chafa output is built under a temporary name and moved into place, so a
+# peer sharing this cache never reads a partially written frame.
 render_sixel() {
-    local png="$1" out="$2" bg_opt=() filled
+    local png="$1" out="$2" tmp bg_opt=()
+    [[ -f "$out" ]] && return 0
     [[ -n "$BG" ]] && bg_opt=(--bg="$BG")
-    if [[ ! -f "$out" ]]; then
-        chafa --format=sixel --size="${CATW}x${HEIGHT_ROWS}" --exact-size=on "${bg_opt[@]}" "$png" >"$out" 2>/dev/null || {
-            rm -f "$out"
-            return 1
-        }
-        # Paint an opaque background under the cat so the terminal's sixel
-        # canvas fill (usually a colored slab) never shows through.
-        if [[ "${#BGR_BGR[@]}" -eq 3 ]]; then
-            filled="${out}.filled"
-            if python3 "$SCRIPT_DIR/sixelfill.py" "$out" "$filled" \
-                "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" \
-                "${FILL_OPTS[@]}" 2>/dev/null; then
-                mv -f "$filled" "$out"
-            else
-                rm -f "$filled"
-            fi
+    tmp="$out.tmp.$$"
+    chafa --format=sixel --size="${CATW}x${HEIGHT_ROWS}" --exact-size=on "${bg_opt[@]}" "$png" >"$tmp" 2>/dev/null || {
+        rm -f "$tmp"
+        return 1
+    }
+    # Paint an opaque background under the cat so the terminal's sixel canvas
+    # fill (usually a colored slab) never shows through.
+    if ((${#BGR_BGR[@]} == 3)); then
+        if python3 "$SCRIPT_DIR/sixelfill.py" fill "$tmp" "$tmp.f" \
+            "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" \
+            "${FILL_OPTS[@]}" 2>/dev/null; then
+            mv -f "$tmp.f" "$tmp"
         else
-            filled="${out}.filled"
-            if python3 "$SCRIPT_DIR/sixelfill.py" norm "$out" "$filled" 2>/dev/null; then
-                mv -f "$filled" "$out"
-            else
-                rm -f "$filled"
-            fi
+            rm -f "$tmp.f"
+        fi
+    else
+        # No background color to paint, but the stream still has to be
+        # normalised: tmux only recognises a DCS that starts with a bare 'q'
+        # and ends with ESC \.
+        if python3 "$SCRIPT_DIR/sixelfill.py" norm "$tmp" "$tmp.f" 2>/dev/null; then
+            mv -f "$tmp.f" "$tmp"
+        else
+            rm -f "$tmp.f"
         fi
     fi
+    mv -f "$tmp" "$out"
 }
 
 declare -a SIX
@@ -168,123 +310,216 @@ done
 # frame and only the newest cat stays visible; every older cover is the
 # terminal background color and therefore invisible.
 COVER=""
-if [[ "${#BGR_BGR[@]}" -eq 3 && -n "${SIX[0]}" && -f "${SIX[0]}" ]]; then
+if ((${#BGR_BGR[@]} == 3)) && [[ -f "${SIX[0]}" ]]; then
     COVER="$SIX_DIR/cover.six"
     if [[ ! -f "$COVER" ]]; then
-        python3 "$SCRIPT_DIR/sixelfill.py" cover "${SIX[0]}" "$COVER" \
+        if python3 "$SCRIPT_DIR/sixelfill.py" cover "${SIX[0]}" "$COVER.tmp.$$" \
             "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" \
-            "${COVER_OPTS[@]}" 2>/dev/null || COVER=""
+            "${COVER_OPTS[@]}" 2>/dev/null; then
+            mv -f "$COVER.tmp.$$" "$COVER"
+        else
+            rm -f "$COVER.tmp.$$"
+            COVER=""
+        fi
     fi
 fi
 
-# walk width in cells
+if [[ -n "$LOCK_FD" ]]; then
+    flock -u 9 2>/dev/null
+    exec 9>&-
+fi
+
+# Hold the sixel payloads in memory. Forking `cat` for every frame (plus the
+# cover) meant ~40 processes a second per window; a bash string costs nothing.
+declare -a SIXDATA
+for out in "${SIX[@]}"; do
+    SIXDATA+=("$(<"$out")")
+done
+COVERDATA=""
+[[ -n "$COVER" && -f "$COVER" ]] && COVERDATA="$(<"$COVER")"
+
+# --- geometry ---------------------------------------------------------------
+# Everything that can change under us in one tmux round-trip: the pane's size,
+# and the window's cell geometry. Those were two separate `tmux display` forks
+# per resize.
+#
+# ROW is the 1-indexed cursor row, placing the cat as low as possible without
+# triggering tmux's sixel scroll (screen-write.c scrolls if the image reaches
+# the last row).
 MAXX=1
 PANEW=1
-update_maxx() {
-    PANEW="$(tmux display -p -t "${TMUX_PANE:-}" '#{pane_width}' 2>/dev/null)"
-    [[ -z "$PANEW" || ! "$PANEW" =~ ^[0-9]+$ ]] && PANEW="$(stty size | awk '{print $2}')"
-    [[ -z "$PANEW" || ! "$PANEW" =~ ^[0-9]+$ ]] && PANEW=1
-    MAXX=$((PANEW - CATW))
-    ((MAXX < 1)) && MAXX=1
-}
-
-# Bottom-row placement: position the cat as low as possible without triggering
-# tmux's sixel scroll (screen-write.c:2925 scrolls if the image reaches the
-# last row).  ROW is the 1-indexed cursor row.
 PANEH=1
 ROW=1
-update_row() {
-    PANEH="$(tmux display -p -t "${TMUX_PANE:-}" '#{pane_height}' 2>/dev/null)"
-    [[ -z "$PANEH" || ! "$PANEH" =~ ^[0-9]+$ ]] && PANEH=1
-    local eff="$HEIGHT_ROWS"
+update_geom() {
+    local geom pw ph cw ch eff
+    geom="$(tmux display -p -t "${TMUX_PANE:-}" \
+        '#{pane_width} #{pane_height} #{window_cell_width} #{window_cell_height}' 2>/dev/null)"
+    read -r pw ph cw ch <<< "$geom"
+
+    PANEW="$pw"
+    [[ "$PANEW" =~ ^[0-9]+$ ]] || PANEW="$(stty size 2>/dev/null | awk '{print $2}')"
+    [[ "$PANEW" =~ ^[0-9]+$ ]] || PANEW=1
+    MAXX=$((PANEW - CATW))
+    ((MAXX < 1)) && MAXX=1
+
+    PANEH="$ph"
+    [[ "$PANEH" =~ ^[0-9]+$ ]] || PANEH=1
+    # The cat lives in a HEIGHT_ROWS+1 strip. If the pane is bigger than that -
+    # which it briefly is when the last other pane in the window exits and this
+    # one is stretched over the whole window - keep placing the cat as though
+    # the strip were still its size, rather than chasing the new bottom edge
+    # and drawing sixels at the foot of the screen on the way out.
+    ((PANEH > HEIGHT_ROWS + 1)) && PANEH=$((HEIGHT_ROWS + 1))
+    eff="$HEIGHT_ROWS"
     ((eff > PANEH - 1)) && eff=$((PANEH - 1))
     ROW=$((PANEH - eff))
     ((ROW < 1)) && ROW=1
+
+    # Every cached frame was baked for CELLW x CELLH. If tmux has since revised
+    # what a cell is in this window - which only happens when it genuinely
+    # resizes the window, and is exactly how a stale 16x32 gets corrected - the
+    # canvas no longer maps to CATW x HEIGHT_ROWS cells and the cat would draw
+    # at the wrong scale. Start over instead. The traps deliberately do not run:
+    # the replacement paints the same strip, so discarding the sixel layer in
+    # between would only flash. This cannot spin, because the value compared
+    # here is the same one the new process reads to bake with.
+    if ((CELL_AUTO)) && [[ "$cw" =~ ^[0-9]+$ && "$ch" =~ ^[0-9]+$ ]] &&
+        ((cw > 0 && ch > 0)) && ((cw != CELLW || ch != CELLH)); then
+        exec "$SCRIPT_DIR/catwalk"
+    fi
+    return 0
 }
 
-# paint the entire pane with spaces to overwrite the sixel pixels. On Konsole
-# glyph overwrites don't erase sixels (KDE bug 456354), so the watchdog
-# discards the graphics layer after this cat dies.
+# A full-pane rectangle in the terminal background color. The cat draws on top
+# of it and the cover strip erases the old cat position with the same color.
+# The filename carries the pane geometry: this used to be a single bg.six whose
+# size was whatever the first window to start happened to be, which every other
+# window then reused at the wrong size.
+BGDATA=""
+make_bg() {
+    BGDATA=""
+    ((${#BGR_BGR[@]} == 3)) || return 0
+    local f tmp px py nb b rows
+    # One row short of the pane, on purpose: tmux scales any sixel taller than
+    # screen_size_y - 1 (screen-write.c), so a full-height strip was resampled
+    # and top-cropped down to exactly this on every single repaint. The row we
+    # give up is the cat's bottom clearance, which is never drawn into anyway.
+    rows=$((PANEH - 1))
+    ((rows < 1)) && rows=1
+    f="$SIX_DIR/bg-${PANEW}x${rows}.six"
+    if [[ ! -f "$f" ]]; then
+        px=$((PANEW * CELLW))
+        py=$((rows * CELLH))
+        nb=$(((py + 5) / 6))
+        tmp="$f.tmp.$$"
+        if {
+            printf '\033Pq"1;1;%d;%d#0;2;%d;%d;%d' \
+                "$px" "$py" \
+                "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}"
+            for ((b = 0; b < nb; b++)); do
+                ((b > 0)) && printf '-'
+                printf '#0!%d~$' "$px"
+            done
+            printf '\033\\'
+        } >"$tmp" 2>/dev/null; then
+            mv -f "$tmp" "$f"
+        else
+            rm -f "$tmp"
+        fi
+    fi
+    [[ -f "$f" ]] && BGDATA="$(<"$f")"
+    return 0
+}
+
+# --- teardown ---------------------------------------------------------------
 cleanup() {
-    printf '\033Ptmux;\033\033[2J\033[H\033\\'
-    printf '\033[1;1H'
-    local row
-    for ((row = 0; row < PANEH; row++)); do
-        printf '%*s\n' "$((PANEW))" ""
-    done
+    trap - INT TERM HUP EXIT
+    sixel_discard
     printf '\033[?25h'
     exit 0
 }
 trap cleanup INT TERM HUP EXIT
+
 printf '\033[?25l'
-update_maxx
-update_row
-trap 'update_maxx; update_row' WINCH
+update_geom
+NEED_BG=1
+# A resize is the earliest notice we get that the last other pane went away:
+# this pane has to grow for that to happen. Ask the loop to re-check who is
+# left before it draws anything else.
+NEED_CHECK=0
+on_winch() {
+    update_geom
+    NEED_BG=1
+    NEED_CHECK=1
+}
+trap on_winch WINCH
 
-# Generate a full-pane background sixel to paint the entire pane in the
-# terminal background color.  The cat draws on top of this; the cover strip
-# (same size as a frame) erases the old cat position with the same color.
-BG_SIX="$SIX_DIR/bg.six"
-if [[ ! -f "$BG_SIX" && "${#BGR_BGR[@]}" -eq 3 ]]; then
-    PANEW_PX=$((PANEW * CELLW))
-    PANEH_PX=$((PANEH * CELLH))
-    NBANDS=$(( (PANEH_PX + 5) / 6 ))
-    {
-        printf '\033Pq"1;1;%d;%d#0;2;%d;%d;%d' \
-            "$PANEW_PX" "$PANEH_PX" \
-            "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}"
-        for ((b = 0; b < NBANDS; b++)); do
-            ((b > 0)) && printf '-'
-            printf '#0!%d~$' "$PANEW_PX"
-        done
-        printf '\033\\'
-    } > "$BG_SIX"
-fi
-
-# Place the full-pane background once before the animation loop.
-if [[ -f "$BG_SIX" ]]; then
-    printf '\033[1;1H'
-    cat "$BG_SIX" 2>/dev/null
-fi
-
+# --- walk -------------------------------------------------------------------
+# Position and animation frame are a pure function of the clock rather than
+# counters advanced once per iteration. Counters made a cat's phase depend on
+# when it happened to start - which is why a window opened mid-walk began again
+# from the edge - and they drifted besides, since each iteration costs the sleep
+# plus however much work that particular frame did. Deriving both from the time
+# means separate cats agree by construction and cannot come apart.
 idx=0
-if [[ "$DIRECTION" == "rtl" ]]; then
-    x=$MAXX
-else
-    x=0
-fi
+x=0
 tick=0
 prev_x=-1
+last_steps=$((${EPOCHREALTIME/[.,]/} / FRAME_US))
 while :; do
     # If our tmux server is gone (kill-server) we are orphaned - bow out
-    # gracefully so we don't leak. The watchdog clears residue, then exits.
-    if ((tick++ % 20 == 0)); then
+    # gracefully so we don't leak. Same cadence for the window bookkeeping:
+    # this used to fork `tmux list-panes` and `wc` on every single frame.
+    if ((tick++ % 20 == 0 || NEED_CHECK)); then
+        NEED_CHECK=0
         tmux has-session >/dev/null 2>&1 || break
+        if [[ -n "$WIN_ID" && -n "$PANE_ID" ]]; then
+            pane_alone_or_duplicate && break
+        fi
     fi
-    [[ -n "$WIN_ID" ]] && (( $(tmux list-panes -t "$WIN_ID" 2>/dev/null | wc -l) <= 1 )) && break
-    # Without a cover, a full clear is the only way to erase the old image.
-    if [[ -z "$COVER" || ! -f "$COVER" ]]; then
-        printf "\033[2J\033[%d;1H" "$ROW"
-    fi
-    # cover the previous position so no stale cat remains on screen
-    if ((prev_x >= 0)) && [[ -n "$COVER" && -f "$COVER" ]]; then
-        printf "\033[%d;%dH" "$ROW" "$((prev_x + 1))"
-        cat "$COVER" 2>/dev/null
-    fi
-    printf "\033[%d;%dH" "$ROW" "$((x + 1))"
-    if [[ -f "${SIX[$idx]}" ]]; then
-        cat "${SIX[$idx]}" 2>/dev/null
-    else
-        cat "${SIX[0]}" 2>/dev/null
-    fi
-    prev_x=$x
+    now=${EPOCHREALTIME/[.,]/}
+    steps=$((now / FRAME_US))
+    idx=$((steps % N))
+    span=$((MAXX + 1))
+    pos=$(((steps * STEP) % span))
     if [[ "$DIRECTION" == "rtl" ]]; then
-        x=$((x - STEP))
-        ((x < 0)) && x=$MAXX
+        x=$((MAXX - pos))
     else
-        x=$((x + STEP))
-        ((x > MAXX)) && x=0
+        x=$pos
     fi
-    idx=$(((idx + 1) % N))
-    sleep "$FRAME_DELAY"
+    # A gap in the frame numbers means we were stalled - starved of time while
+    # tmux was busy with a resurrect save, say - and the clock has since moved
+    # us well away from prev_x. The cover strip is one cat wide and only erases
+    # a single step, so repaint the whole strip instead of leaving the pre-stall
+    # frame stranded on the terminal with nothing sized to cover it.
+    ((steps - last_steps > 2)) && NEED_BG=1
+    last_steps=$steps
+    if ((NEED_BG)); then
+        make_bg
+        if [[ -n "$BGDATA" ]]; then
+            printf '\033[1;1H%s' "$BGDATA"
+        else
+            printf '\033[2J'
+        fi
+        prev_x=-1
+        NEED_BG=0
+    fi
+    # Without a cover, a full clear is the only way to erase the old image.
+    if [[ -z "$COVERDATA" ]]; then
+        printf '\033[2J'
+    elif ((prev_x >= 0)); then
+        # cover the previous position so no stale cat remains on screen
+        printf '\033[%d;%dH%s' "$ROW" "$((prev_x + 1))" "$COVERDATA"
+    fi
+    printf '\033[%d;%dH%s' "$ROW" "$((x + 1))" "${SIXDATA[$idx]}"
+    prev_x=$x
+    # Sleep to the next frame boundary rather than for a fixed delay: that keeps
+    # every cat waking on the same instants, and it is self-correcting, so a slow
+    # frame is caught up instead of accumulating. A skipped frame is safe - the
+    # cover strip is drawn at prev_x, wherever the cat actually last appeared, so
+    # a jump still erases cleanly and leaves no trail.
+    delay=$(((steps + 1) * FRAME_US - ${EPOCHREALTIME/[.,]/}))
+    ((delay > 0)) || delay=$FRAME_US
+    printf -v nap '%d.%06d' "$((delay / 1000000))" "$((delay % 1000000))"
+    sleep "$nap"
 done

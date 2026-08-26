@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# catpoke - tell every cat to re-check its visibility right now.
+#
+# Zooming a pane hides the others without resizing them, so no SIGWINCH arrives
+# and the cat's own two-second sweep is far too slow to notice: the frame it
+# last painted would sit on the terminal, over the chooser, until then. The
+# window-layout-changed hook runs this, and SIGUSR1 makes each cat re-evaluate
+# on its next frame.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=helpers.sh
+. "$SCRIPT_DIR/helpers.sh"
+
+while read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    # A pane option outlives nothing here, but PIDs are reusable - only signal a
+    # process that really is one of our cats.
+    grep -qa catwalk "/proc/$pid/cmdline" 2>/dev/null || continue
+    kill -USR1 "$pid" 2>/dev/null || true
+done < <(tmux list-panes -a -f '#{@catwalk}' -F '#{@catwalk-pid}' 2>/dev/null)

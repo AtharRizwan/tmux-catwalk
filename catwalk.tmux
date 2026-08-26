@@ -15,9 +15,26 @@ default() {
     fi
 }
 
+# Cell geometry used to be baked in as 11x26 / 2.4, which is only right for the
+# terminal it was measured on -- and, worse, only right for the windows tmux
+# happens to agree with: it measures a sixel in cells using the window's own
+# xpixel/ypixel, and a window that has never been resized keeps tmux's 16x32
+# default forever, drawing the cat a fifth too narrow. Both are detected at
+# render time now. Take back the two values this plugin itself wrote, once per
+# server, so an existing session picks up the fix without being unset by hand.
+if [[ "$(tmux show-options -gv @catwalk-cell-auto 2>/dev/null)" != "1" ]]; then
+    [[ "$(tmux show-options -gv @catwalk-cell-px 2>/dev/null)" == "11x26" ]] &&
+        tmux set-option -g @catwalk-cell-px auto
+    [[ "$(tmux show-options -gv @catwalk-cell-ratio 2>/dev/null)" == "2.4" ]] &&
+        tmux set-option -g @catwalk-cell-ratio auto
+    tmux set-option -g @catwalk-cell-auto 1
+fi
+
 default cats-on 1
 default catwalk-height 3
-default catwalk-cell-ratio 2.4
+default catwalk-cell-ratio auto
+default catwalk-cell-px auto
+default catwalk-top-pad 1
 default catwalk-fps 10
 default catwalk-step 1
 default catwalk-direction rtl
@@ -26,8 +43,8 @@ default catwalk-bind C
 default catwalk-cache-dir "${XDG_CACHE_HOME:-$HOME/.cache}/tmux-catwalk"
 default catwalk-sixel-check 1
 # Background for the GIF's transparent pixels (sixel has no alpha). Empty =
-# auto-detect the terminal's background color (Konsole); set a hex like
-# #1e1e2e to override.
+# auto-detect the terminal's background color (Konsole color scheme, else
+# $COLORFGBG); set a hex like #1e1e2e to override.
 default catwalk-bg ""
 
 # Cats appear in the initial window of a fresh session (session-created) and
@@ -35,18 +52,63 @@ default catwalk-bg ""
 # hooks cannot tell us which window was created (run-shell's TMUX_PANE points
 # at the session's current pane, not the new window), so we just ensure a cat
 # in every window - dedup in catensure makes it idempotent and cheap.
-tmux set-hook -g session-created "run-shell '$SCRIPTS/catensure-all'"
-tmux set-hook -g after-new-window "run-shell '$SCRIPTS/catensure-all'"
+#
+# A plugin-specific hook index is used rather than the default [0]: a plain
+# `set-hook -g session-created` overwrites index 0 and would silently destroy
+# whatever another plugin (or the user) installed there. Writing to a fixed
+# high index leaves the other slots alone and stays idempotent across reloads,
+# which `set-hook -a` would not (it appends a duplicate every time).
+#
+# Earlier versions did write to index 0. Take that entry back if - and only if -
+# it is still one of ours, so upgrading does not leave the catch-up pass wired
+# up twice, while a hook someone else owns is left untouched.
+unhook_ours() {
+    local ev cur
+    ev="$1"
+    cur="$(tmux show-hooks -g 2>/dev/null | awk -v e="$ev[0]" '$1==e {$1=""; sub(/^ /,""); print}')"
+    if [[ "$cur" == *"$SCRIPTS/catensure-all"* ]]; then
+        tmux set-hook -gu "$ev[0]" 2>/dev/null
+    fi
+}
+unhook_ours session-created
+unhook_ours after-new-window
 
-# Catch-up after a resurrect restore (deferred spawns land here), unless the
-# user defined their own hook.
+tmux set-hook -g 'session-created[99]' "run-shell '$SCRIPTS/catensure-all'"
+tmux set-hook -g 'after-new-window[99]' "run-shell '$SCRIPTS/catensure-all'"
+
+# Zooming a pane hides every other pane without resizing it, so a cat gets no
+# SIGWINCH and would leave its last frame sitting on the terminal. This fires on
+# zoom, unzoom and `choose-tree -Z` alike (verified), and catpoke nudges the cats
+# to re-check what is actually on screen.
+tmux set-hook -g 'window-layout-changed[99]' "run-shell '$SCRIPTS/catpoke'"
+
+# tmux-resurrect brings panes back as plain shells - it does not re-run
+# arbitrary pane commands - so a cat that was present at save time returns as an
+# empty strip, and the catch-up pass would add a real cat beside it: one more
+# dead strip per window per restore. catsave records where the cats were and the
+# post-restore pass respawns those exact panes. Both hooks yield to a
+# user-defined one.
+# post-save-layout is handed the state file and fires before resurrect
+# finalises it. The hook is eval'd by resurrect with that path appended, so it
+# points straight at the script rather than going through run-shell.
+if ! tmux show-options -gv @resurrect-hook-post-save-layout >/dev/null 2>&1; then
+    tmux set-option -g @resurrect-hook-post-save-layout "$SCRIPTS/catsave"
+fi
 if ! tmux show-options -gv @resurrect-hook-post-restore-all >/dev/null 2>&1; then
     tmux set-option -g @resurrect-hook-post-restore-all \
         "tmux run-shell '$SCRIPTS/catensure-all --restored'"
 fi
 
+# Rebinding leaves the previously bound key live unless we take it back first.
+PREV_BIND="$(tmux show-options -gv @catwalk-bound-key 2>/dev/null || true)"
 BIND="$(tmux show-options -gv @catwalk-bind 2>/dev/null || echo C)"
-tmux bind-key "$BIND" run-shell "$SCRIPTS/cattoggle"
+if [[ -n "$PREV_BIND" && "$PREV_BIND" != "$BIND" ]]; then
+    tmux unbind-key "$PREV_BIND" 2>/dev/null
+fi
+if [[ -n "$BIND" ]]; then
+    tmux bind-key "$BIND" run-shell "$SCRIPTS/cattoggle"
+    tmux set-option -g @catwalk-bound-key "$BIND"
+fi
 
 # Catch-up on a running server (reload / tpm install / prefix + I).
 if tmux list-sessions >/dev/null 2>&1; then
