@@ -57,9 +57,10 @@ catwincell() {
     printf '%s' "$v"
 }
 
-# catclientcell <target> - the attached client's real cell size as "WxH". Used
-# for the aspect ratio only, never for the canvas. Empty when nothing is
-# attached.
+# catclientcell <target> - the attached client's real cell size as "WxH". The
+# sixel path uses it for the aspect ratio only, never for the canvas; the kitty
+# path bakes to it, since there the terminal draws the pixmap itself and the
+# window's idea of a cell never enters into it. Empty when nothing is attached.
 catclientcell() {
     local v
     v="$(tmux display -p -t "$1" '#{client_cell_width}x#{client_cell_height}' 2>/dev/null)"
@@ -93,12 +94,17 @@ catsixel_ok() {
     fi
 }
 
-# catbg - best-effort opaque background for transparent pixels. Sixel has no
-# alpha channel, so chafa has to paint those pixels some color; matching the
-# terminal's own background makes the box blend in instead of reading as a
-# black (or blue) slab. Precedence: $CATWALK_BG / @catwalk-bg, else the active
-# Konsole color scheme's [Background] Color, else $COLORFGBG's background index,
-# else empty (chafa assumes black).
+# catbg - best-effort opaque background for transparent pixels in the sixel
+# path. Konsole renders a sixel into an indexed image whose unpainted pixels
+# take colour register 0, opaque, so chafa has to paint those pixels *some*
+# colour; matching the terminal's own background makes the box blend in instead
+# of reading as a black (or blue) slab. Precedence: $CATWALK_BG / @catwalk-bg,
+# else the active Konsole color scheme's [Background] Color, else $COLORFGBG's
+# background index, else empty (chafa assumes black).
+#
+# The literal value `transparent` is a mode marker rather than a colour: it asks
+# for the Kitty graphics path, which has a real alpha channel. It is returned
+# untouched here and resolved by catmode.
 catbg() {
     local v profile file r g b
     # Must be initialised: `local scheme` alone leaves it *unset*, and reading
@@ -157,6 +163,92 @@ catbg_colorfgbg() {
        15) printf '#ffffff' ;;
         *) return 0 ;;
     esac
+}
+
+# --- graphics protocol ------------------------------------------------------
+# Two render paths exist. The sixel one draws through tmux, which parses the
+# image and re-emits it, and is opaque because Konsole ignores sixel's
+# transparency flag (P2=1): Vt102Emulation::hook() enters sixel mode on a bare
+# 'q' and the canvas is an indexed image filled with register 0. The Kitty one
+# goes straight to the terminal through tmux's DCS passthrough and has a real
+# alpha channel, because Konsole keeps the frame as a QPixmap and blends it.
+
+# catgraphics - which protocol to draw with: auto (default), sixel or kitty.
+catgraphics() {
+    local v
+    v="$(catcfg CATWALK_GRAPHICS catwalk-graphics auto)"
+    case "$v" in
+        sixel | kitty | auto) printf '%s' "$v" ;;
+        *) printf 'auto' ;;
+    esac
+}
+
+# catkitty_ok - can we expect Kitty graphics to be understood? There is no way
+# to ask: a query response comes back to tmux, which reads terminal replies
+# itself rather than forwarding them to the pane, so probing would hang or
+# leak the answer into somebody's shell as keystrokes. Recognise the terminals
+# known to implement it instead, and let @catwalk-graphics kitty force it.
+catkitty_ok() {
+    # Konsole exports this into every pane, so it survives into tmux where
+    # $TERM has become tmux-256color and tells us nothing.
+    [[ -n "${KONSOLE_VERSION:-}" ]] && return 0
+    case "${TERM_PROGRAM:-}" in
+        WezTerm | ghostty | kitty) return 0 ;;
+    esac
+    case "${TERM:-}" in
+        xterm-kitty | xterm-ghostty) return 0 ;;
+    esac
+    return 1
+}
+
+# catmode - the resolved render mode: "kitty" or "sixel".
+#
+# Transparency is opt-in and falls back rather than failing: it needs both
+# @catwalk-bg transparent and a terminal that can do it, and if either is
+# missing the opaque sixel path is used exactly as before. Emitting Kitty
+# escapes at a terminal that does not understand them would print the base64
+# payload as garbage, which is much worse than an opaque cat.
+catmode() {
+    local g
+    g="$(catgraphics)"
+    [[ "$g" == "sixel" ]] && { printf 'sixel'; return; }
+    if [[ "$(catbg)" == "transparent" ]]; then
+        if [[ "$g" == "kitty" ]] || catkitty_ok; then
+            printf 'kitty'
+            return
+        fi
+    fi
+    printf 'sixel'
+}
+
+# --- absolute terminal coordinates ------------------------------------------
+# A Kitty placement lands at the cursor (Screen::addPlacement takes _cuY/_cuX
+# when row/col are -1), and tmux does not position a passthrough for us:
+# tty_cmd_rawstring is tty_add() plus tty_invalidate() and nothing else. So the
+# placement has to be preceded by an absolute CSI H, which means converting the
+# pane's own coordinates into the terminal's.
+#
+# tmux's pane_top/pane_left are window-relative and 0-indexed; CSI H is
+# terminal-absolute and 1-indexed. A status line at the top pushes the window
+# down by however many rows it occupies, which is the client's height less the
+# window's.
+
+# catabsorigin <target> - print "ROW COL": the terminal-absolute, 1-indexed
+# position of the pane's top-left cell. Empty when tmux cannot say.
+catabsorigin() {
+    local top left ch wh pos offset
+    read -r top left ch wh < <(tmux display -p -t "$1" \
+        '#{pane_top} #{pane_left} #{client_height} #{window_height}' 2>/dev/null)
+    [[ "$top" =~ ^[0-9]+$ && "$left" =~ ^[0-9]+$ ]] || return 0
+    offset=0
+    if [[ "$ch" =~ ^[0-9]+$ && "$wh" =~ ^[0-9]+$ ]]; then
+        pos="$(tmux show-options -gv status-position 2>/dev/null)"
+        if [[ "$pos" == "top" ]]; then
+            offset=$((ch - wh))
+            ((offset < 0)) && offset=0
+        fi
+    fi
+    printf '%d %d' "$((offset + top + 1))" "$((left + 1))"
 }
 
 # catresurrect_dir - where tmux-resurrect keeps its state, resolved the same way
