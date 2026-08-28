@@ -31,12 +31,19 @@ fi
 # A missing GIF used to spawn a pane that printed to itself and vanished a
 # second later - a flash with no diagnostic, which is the single most likely
 # way to misconfigure this plugin. Say so once, in the status line, instead.
+# @catwalk-gif may name a directory, which is the opt-in to the spawner; an
+# empty one is the same misconfiguration wearing a different hat.
 GIF="$(catgif)"
 if [[ -z "$GIF" ]]; then
     tmux display-message "tmux-catwalk: @catwalk-gif is not set" 2>/dev/null
     exit 0
 fi
-if [[ ! -f "$GIF" ]]; then
+if [[ -d "$GIF" ]]; then
+    if [[ -z "$(catgifs)" ]]; then
+        tmux display-message "tmux-catwalk: no .gif files in $GIF" 2>/dev/null
+        exit 0
+    fi
+elif [[ ! -f "$GIF" ]]; then
     tmux display-message "tmux-catwalk: no cat image at $GIF" 2>/dev/null
     exit 0
 fi

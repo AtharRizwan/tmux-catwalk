@@ -5,6 +5,11 @@ animated image - by default with the [Sixel](https://en.wikipedia.org/wiki/Sixel
 graphics protocol (needs a sixel-capable terminal such as Konsole, xterm, foot
 or WezTerm, plus tmux >= 3.2).
 
+Point `@catwalk-gif` at a *directory* instead of a single file and you get a
+whole menagerie: critters wander in at random, one at a time or three at once,
+each with its own GIF, its own speed and its own direction, with quiet gaps in
+between. See [A directory of critters](#a-directory-of-critters).
+
 Set `@catwalk-bg transparent` and the cat is drawn with the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
 instead, which has a real alpha channel - so the GIF's transparent pixels are
@@ -43,6 +48,14 @@ Use double quotes with `$HOME` rather than single quotes with `~`: tmux does not
 expand a tilde inside a single-quoted option value. (A leading `~` is expanded
 as a courtesy, but `$HOME` is the form that always works.)
 
+Or point it at a directory of GIFs and let the spawner loose:
+
+```tmux
+set -g @catwalk-gif "$HOME/Pictures/catwalk"   # a directory, not a file
+set -g @catwalk-direction random
+set -g @catwalk-step "0.5-1"                   # a range, so they amble at different speeds
+```
+
 ## Options
 
 | option                 | default                                    | description                                                                         |
@@ -54,9 +67,15 @@ as a courtesy, but `$HOME` is the form that always works.)
 | `@catwalk-cell-px`     | _(auto)_                                   | override the cell size in pixels (`WxH`) the frames are rendered to                 |
 | `@catwalk-top-pad`     | `1`                                        | 6px bands of headroom above the cat's head (shifts the cat down); `0` disables      |
 | `@catwalk-fps`         | `10`                                       | animation frames per second                                                         |
-| `@catwalk-step`        | `1`                                        | cells the cat advances per tick                                                     |
-| `@catwalk-direction`   | `rtl`                                      | `rtl` (right to left) or `ltr`                                                      |
-| `@catwalk-gif`         | **(required)**                             | path to a walking-cat GIF                                                           |
+| `@catwalk-step`        | `1`                                        | cells advanced per tick, decimals allowed (`0.5`); `MIN-MAX` (e.g. `0.5-1`) gives the spawner a range to draw each critter's speed from |
+| `@catwalk-direction`   | `rtl`                                      | `rtl` (right to left), `ltr`, or `random` for a direction per critter               |
+| `@catwalk-gif`         | **(required)**                             | a walking-cat GIF, or a directory of them (see [A directory of critters](#a-directory-of-critters)) |
+| `@catwalk-facing`      | `rtl`                                      | which way the artwork itself walks, so the spawner knows who to mirror; a file named `fox.ltr.gif` overrides it |
+| `@catwalk-mirror`      | `1`                                        | flip the frames of a critter walking against its artwork; `0` to never mirror       |
+| `@catwalk-max-cats`    | `3`                                        | roughly the busiest the strip gets; sets how often critters are born (directory mode) |
+| `@catwalk-spawn`       | _(auto)_                                   | seconds between spawn chances; unset lets `@catwalk-max-cats` decide, a number pins it and overrides |
+| `@catwalk-density`     | `70`                                       | percentage of spawn chances that actually produce a critter - how bunched up the arrivals are, not how many |
+| `@catwalk-max-gifs`    | `0`                                        | cap on how many GIFs to take from a large directory (`0` = all)                     |
 | `@catwalk-bind`        | `C`                                        | prefix key to toggle cats                                                           |
 | `@catwalk-bg`          | _(auto)_                                   | background for the GIF's transparent pixels; empty = detect terminal bg, hex overrides, `transparent` = real alpha |
 | `@catwalk-graphics`    | `auto`                                     | `auto`, `sixel` or `kitty` - which graphics protocol to draw with                   |
@@ -65,6 +84,120 @@ as a courtesy, but `$HOME` is the form that always works.)
 
 Every option also has a `CATWALK_*` environment override (`CATWALK_HEIGHT`,
 `CATWALK_FPS`, ...) which takes precedence over the tmux option.
+
+## A directory of critters
+
+`@catwalk-gif` may name a single GIF or a directory. The two behave differently
+on purpose:
+
+- **A single GIF** walks end to end, continuously, wrapping at the edge. This is
+  the original behaviour and nothing about it has changed.
+- **A directory** turns on the spawner. Every `.gif` directly inside it joins the
+  pool (subdirectories are ignored, symlinks are followed). A critter is born
+  every few seconds - a random one from the pool, at a random speed within
+  `@catwalk-step`, in a random direction if `@catwalk-direction` is `random` -
+  walks one crossing, and is gone. `@catwalk-density` decides how many of those
+  chances come to nothing, which is what puts the quiet gaps in.
+
+### How busy the strip gets
+
+`@catwalk-max-cats` is the one knob for this. It is a soft maximum rather than a
+hard cap: the plugin works out how long a crossing takes on your pane at your
+speeds, and spawns often enough to keep about two thirds of that many walking, so
+the number you set reads as the busiest it usually gets. At the default of `3` on
+a wide pane the strip is empty about 6% of the time, holds one 25%, two 37%,
+three 24%, and occasionally four.
+
+It cannot be a hard cap. Enforcing one means turning critters away, and a critter
+turned away has to stay away for its whole crossing - re-decide it each tick and
+it pops into existence halfway across the strip the moment room appears. The
+rules that decide it once, at birth, are either far too pessimistic (size every
+lane for the slowest crossing possible, which with a range like `1-3` leaves one
+animal on screen nearly all the time) or unstable (ask whether the last critter
+in that lane has left, and the answer depends on a chain of earlier such answers
+that never settles). Letting the count vary around a target is the honest option,
+and it is also what looks most like wildlife.
+
+Turn `@catwalk-max-cats` down for a quieter strip and up for a busier one; it
+scales about linearly. `@catwalk-density` does *not* change how many there are -
+it cancels out - it changes how bunched up the arrivals are: low values mean
+fewer, more clustered spawn chances and longer quiet stretches. Set
+`@catwalk-spawn` to a number only if you want to pin the interval yourself, in
+which case `@catwalk-max-cats` stops deciding anything.
+
+None of that randomness is actually rolled. Every property of a critter is a
+bit-field of a hash of the *spawn slot number*, so the whole menagerie stays a
+pure function of the wall clock, exactly as a single cat's position always was.
+That is what lets every window of a session show the same animals in the same
+places, and a window opened mid-walk join what is already happening instead of
+starting over.
+
+### How fast they walk
+
+`@catwalk-step` is cells per tick, and `@catwalk-fps` is ticks per second, so the
+default `1` at `10` fps is ten columns a second - brisk. Decimals are allowed, and
+a `MIN-MAX` range is what gives a pool its variety of gaits. What matters is how
+long a crossing takes, which depends on how wide your pane is; on a 170-column
+one:
+
+| `@catwalk-step` | time to cross |
+| --------------- | ------------- |
+| `2`             | 8s            |
+| `1`             | 16s           |
+| `0.5-1`         | 16-33s        |
+| `0.3-0.8`       | 20-54s        |
+| `0.2-0.5`       | 33-82s        |
+
+Speed does not change how many critters there are: the spawn interval is worked
+out from how long a crossing takes, so slower critters simply arrive less often.
+Set the pace with `@catwalk-step` and the crowd with `@catwalk-max-cats`; they do
+not interfere.
+
+Lowering `@catwalk-fps` also slows the walk, but it slows the *animation* with it
+and the legs start to stutter. Use `@catwalk-step` for pace and leave the frame
+rate alone.
+
+### Mirroring
+
+A critter walking against the way its artwork was drawn would moonwalk, so its
+frames are mirrored (one `hflip` at extraction time, cached separately).
+`@catwalk-facing` says which way the artwork walks; a directory holding critters
+drawn both ways can say so per file, with a `.ltr.` or `.rtl.` before the
+extension:
+
+```
+catwalk/
+  maneki.gif        <- uses @catwalk-facing
+  firefox.ltr.gif   <- drawn walking left to right
+  stripes.rtl.gif   <- drawn walking right to left
+```
+
+### What it costs
+
+The first launch renders every GIF in the pool - twice over when directions are
+random, once per mirroring - which on the sixel path is a couple of seconds per
+GIF while the pane sits empty. It is all cached on disk and shared between
+windows, so every launch after that is instant. Frames are only read into a
+cat's memory, and only handed to the terminal, the first time that critter
+actually appears.
+
+Drawing three critters costs three times what drawing one did. That matters on
+the sixel path, where every frame is a whole image pushed through tmux; turn
+`@catwalk-max-cats` down if it shows. On the transparent path a tick is still
+just a handful of short escape sequences however many critters are walking.
+
+### Limits
+
+- Critters appear and disappear at the pane edges rather than sliding on and
+  off: neither graphics protocol can clip an image mid-cell.
+- Every GIF is scaled to `@catwalk-height`, so a pool of very different aspect
+  ratios gives very different widths.
+- `@catwalk-max-cats` is a target, not a ceiling - see
+  [How busy the strip gets](#how-busy-the-strip-gets). Setting it very high runs
+  into an internal limit of 16 simultaneous critters.
+- A narrow pane makes for short crossings and therefore frequent spawns; a very
+  wide one with a slow `@catwalk-step` makes for long ones and rarer arrivals.
+  The plugin adjusts the interval for you either way, and re-adjusts on resize.
 
 ## Usage
 
@@ -157,15 +290,25 @@ below it.
   pane option; that option, not a pattern match on the pane's command, is how
   every other script recognises a cat.
 - `catwalk` extracts the GIF frames with ffmpeg, renders them to sixel with
-  chafa (cached, keyed by GIF + size + background + padding + protocol),
-  post-processes them with `sixelfill.py` to paint an opaque background under
-  the sprite, and then walks the sprite across the pane.
-- Frames are held in memory and the cat's position is erased with a
+  chafa (cached, keyed by GIF + size + background + padding + protocol +
+  mirroring), post-processes them with `sixelfill.py` to paint an opaque
+  background under the sprite, and then walks the sprites across the pane.
+- Frames are held in memory and each sprite's position is erased with a
   background-colored "cover" strip rather than a screen clear, so the animation
-  costs a `sleep` and a `printf` per frame.
+  costs a `sleep` and a `printf` per frame. Every cover for the tick is emitted
+  before any sprite is: a later sixel placement draws over an earlier one, so
+  erasing everybody first is what stops two overlapping critters from rubbing
+  each other out.
+- In directory mode each critter walks in a *lane*, and a lane is pure
+  arithmetic: the critter born in spawn slot `k` uses lane `k % LANES`. There are
+  as many lanes as the slowest possible crossing needs, so a lane is always clear
+  before it comes round again - which is deliberately independent of
+  `@catwalk-max-cats`, and means nothing ever has to be turned away for want of
+  one. `@catwalk-max-cats` sets the spawn *rate* instead.
 - On the transparent path the frames are not rendered to sixel at all.
   `catkitty.py` turns the extracted PNGs into one chunked Kitty
-  `a=t` (transmit) blob, printed once at startup; each tick then only prints an
+  `a=t` (transmit) blob per GIF, printed the first time that critter appears;
+  each tick then only prints an
   absolute `CSI H`, an `a=p` (place) for the new frame and an `a=d,d=i` (delete)
   for the previous one, in a single passthrough payload. Because tmux never
   moves the cursor for passthrough output, the cat computes its own
@@ -216,11 +359,22 @@ exactly the case a zoomed-away cat needs to clear itself out of.
 
 ## Troubleshooting
 
-- **No cat appears**: ensure `@catwalk-gif` points to a valid GIF file (a bad
-  path is reported in the status line) and that your terminal supports sixel -
+- **No cat appears**: ensure `@catwalk-gif` points to a valid GIF file, or to a
+  directory containing at least one `.gif` (a bad path, or an empty directory,
+  is reported in the status line) and that your terminal supports sixel -
   `tmux list-clients -F '#{client_termfeatures}'` must include `sixel`. That
   check is a sixel-path one; on the transparent path it is skipped, since tmux
   has no feature flag for Kitty graphics.
+- **They walk too fast or too slowly**: `@catwalk-step`, which takes decimals -
+  `0.5-1` is a comfortable amble on a wide pane, `0.2-0.5` a crawl. See
+  [How fast they walk](#how-fast-they-walk). Do not reach for `@catwalk-fps`:
+  it stutters the animation as well as slowing the walk.
+- **Critters are too sparse, or too crowded**: `@catwalk-max-cats` is the knob -
+  it scales about linearly, and the strip averages roughly two thirds of it.
+  `@catwalk-density` will not help: it changes how clustered the arrivals are,
+  not how many there are.
+- **The first launch sits there empty**: every GIF in the directory is being
+  rendered. It is cached; only the first run pays for it.
 - **Ghost pixels after toggle**: this is Konsole bug 456354, and it is
   specific to the sixel path. The exit trap clears the sixel layer
   automatically; if it persists, try `prefix + C` twice. On the transparent

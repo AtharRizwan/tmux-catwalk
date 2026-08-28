@@ -37,8 +37,24 @@ default catwalk-cell-px auto
 default catwalk-top-pad 1
 default catwalk-fps 10
 default catwalk-step 1
+# ltr, rtl, or random. random draws a direction per critter and mirrors the
+# artwork of the ones walking against the way they were drawn.
 default catwalk-direction rtl
+# A single GIF walks end to end for ever, exactly as it always has. A directory
+# turns on the spawner: critters appear at random, one at a time or three at
+# once, each with its own GIF, speed and direction.
 default catwalk-gif ""
+# Which way the artwork itself walks, so the spawner knows who to mirror. A file
+# named `fox.ltr.gif` says so for itself and overrides this.
+default catwalk-facing rtl
+default catwalk-mirror 1
+# Spawner shape: how many critters to keep walking at once, how often one is
+# born (auto = as often as @catwalk-max-cats needs), how bunched up the arrivals
+# are, and a cap on how many GIFs to take out of a large directory.
+default catwalk-max-cats 3
+default catwalk-spawn auto
+default catwalk-density 70
+default catwalk-max-gifs 0
 default catwalk-bind C
 default catwalk-cache-dir "${XDG_CACHE_HOME:-$HOME/.cache}/tmux-catwalk"
 default catwalk-sixel-check 1

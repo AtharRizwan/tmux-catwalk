@@ -30,13 +30,50 @@ catcache() {
     catcfg CATWALK_CACHE catwalk-cache-dir "${XDG_CACHE_HOME:-$HOME/.cache}/tmux-catwalk"
 }
 
-# catgif - the configured GIF, with a leading ~ expanded. tmux does not expand
-# a tilde inside a single-quoted option value and bash will not expand one that
-# arrives via a variable, so a `~/...` path would otherwise never resolve.
+# catgif - the configured GIF *path*, with a leading ~ expanded. tmux does not
+# expand a tilde inside a single-quoted option value and bash will not expand
+# one that arrives via a variable, so a `~/...` path would otherwise never
+# resolve. This may name a directory; catgifs is what turns it into a pool.
 catgif() {
     local g
     g="$(catcfg CATWALK_GIF catwalk-gif '')"
     printf '%s' "${g/#\~/$HOME}"
+}
+
+# catgifs - every GIF in the pool, one path per line.
+#
+# @catwalk-gif may name a single file, as it always could, or a directory, in
+# which case every .gif inside it joins the pool and the spawner draws from all
+# of them. The listing is sorted because the spawner picks a critter by hashing
+# a slot number into this array: an ordering that differed between panes would
+# put a different animal in every window at the same instant, and the whole
+# point of deriving everything from the clock is that they agree.
+#
+# Symlinks count (-xtype f resolves them), subdirectories deliberately do not.
+catgifs() {
+    local g
+    g="$(catgif)"
+    [[ -n "$g" ]] || return 0
+    if [[ -d "$g" ]]; then
+        find "$g" -maxdepth 1 -xtype f -iname '*.gif' -print 2>/dev/null | LC_ALL=C sort
+    else
+        printf '%s\n' "$g"
+    fi
+}
+
+# catfacing <path> <default> - which way the artwork in this GIF walks, ltr or
+# rtl. Sprites that travel against their artwork are mirrored, so this has to be
+# known per file: one directory can easily hold critters drawn facing both ways,
+# and a single global setting would leave half of them moonwalking. A filename
+# may say so itself - `fox.ltr.gif` - and otherwise the pool default applies.
+catfacing() {
+    local base
+    base="${1##*/}"
+    case "${base,,}" in
+        *.ltr.gif) printf 'ltr'; return 0 ;;
+        *.rtl.gif) printf 'rtl'; return 0 ;;
+    esac
+    [[ "${2:-rtl}" == "ltr" ]] && printf 'ltr' || printf 'rtl'
 }
 
 # tmux measures a sixel in cells with the *window's* idea of a cell (input.c

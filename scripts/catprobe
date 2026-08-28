@@ -61,7 +61,10 @@ if [[ -z "$FRAME" ]]; then
     FRAME="$(ls -1t "$(catcache)"/*/f001.png 2>/dev/null | head -1)"
 fi
 if [[ -z "$FRAME" || ! -f "$FRAME" ]]; then
-    GIF="$(catgif)"
+    # Any critter in the pool will do - this only proves the terminal can be
+    # handed a pixmap - so take the first, which also works when @catwalk-gif
+    # names a whole directory.
+    GIF="$(catgifs | head -1)"
     [[ -f "$GIF" ]] || die "no cached frame and no usable @catwalk-gif"
     require_cmd ffmpeg || die "ffmpeg is required to extract a frame"
     TMPD="$(mktemp -d)"

@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# catwalk - a cute cat walking across the top of a tmux pane, rendered with
-# real images via the Sixel graphics protocol (Konsole + tmux >= 3.2).
+# catwalk - cute critters walking across the top of a tmux pane, rendered with
+# real images via the Sixel or Kitty graphics protocol (Konsole + tmux >= 3.2).
+#
+# @catwalk-gif names either one GIF - which walks continuously, exactly as it
+# always has - or a whole directory of them, which turns on the spawner: a
+# critter is born every few seconds with a GIF, a speed and a direction of its
+# own, walks one crossing and is gone, so the strip holds sometimes none,
+# sometimes three. None of those "random" values is a roll of the dice; each is
+# a bit-field of a hash of the spawn slot number, which keeps the whole
+# menagerie a pure function of the wall clock. That is what lets every window of
+# the session show the same animals in the same places, and a window opened
+# mid-walk join what is already happening rather than starting over.
 #
 # Sizing/animation are driven by tmux options (@catwalk-*) or env overrides
-# (CATWALK_*). The exit trap discards the terminal's sixel graphics layer, so
-# no ghost pixels survive however this cat dies.
+# (CATWALK_*). The exit trap discards the terminal's graphics layer, so no ghost
+# pixels survive however this cat dies.
 
 set -uo pipefail
 
@@ -19,7 +29,6 @@ die() {
     exit 1
 }
 
-GIF="$(catgif)"
 CACHE="$(catcache)"
 
 # --- render mode ------------------------------------------------------------
@@ -30,12 +39,23 @@ CACHE="$(catcache)"
 # cache key and which half of the draw loop runs. See catmode in helpers.sh.
 BG="$(catbg)"
 MODE="$(catmode)"
-# Frame count and the base of this render's kitty image ids. Both are filled in
-# once the frames are known, but they have to exist from here: the early
-# duplicate check below can reach kitty_clear, and an unset name under `set -u`
-# would abort the function mid-teardown.
-N=0
-ID_BASE=0
+
+# --- the pool ---------------------------------------------------------------
+# GIFSRC is what the user configured; POOL is what that expands to. A directory
+# is the opt-in to the spawner: a single file keeps walking end to end the way
+# it did before this existed, so no existing config changes behaviour.
+GIFSRC="$(catgif)"
+mapfile -t POOL < <(catgifs)
+
+MAX_GIFS="$(catcfg CATWALK_MAX_GIFS catwalk-max-gifs 0)"
+[[ "$MAX_GIFS" =~ ^[0-9]+$ ]] || MAX_GIFS=0
+if ((MAX_GIFS > 0)) && ((${#POOL[@]} > MAX_GIFS)); then
+    POOL=("${POOL[@]:0:MAX_GIFS}")
+fi
+NGIFS=${#POOL[@]}
+
+SPAWN=0
+[[ -d "$GIFSRC" ]] && SPAWN=1
 
 # --- sizing -----------------------------------------------------------------
 HEIGHT_ROWS="$(catcfg CATWALK_HEIGHT catwalk-height 3)" # rows the cat occupies
@@ -72,64 +92,140 @@ CELLH="${CELLPX##*[xX]}"
 # 6px bands of headroom to add above the cat's head (shifts the cat down).
 TOPPAD="$(catcfg CATWALK_TOP_PAD catwalk-top-pad 1)"
 [[ "$TOPPAD" =~ ^[0-9]+$ ]] || TOPPAD=1
-# Width in columns: an explicit @catwalk-width / CATWALK_WIDTH wins; otherwise
-# derive it from @catwalk-height and the GIF's own proportions so the cat stays
-# proportionate at any height. RATIO is a terminal cell's height/width (8x16
-# fonts 2.0, this Konsole 26/11); tune @catwalk-cell-ratio if the cat looks
-# squished or skinny.
-CATW="$(catcfg CATWALK_WIDTH catwalk-width '')"
-if [[ -n "$CATW" ]] && { [[ ! "$CATW" =~ ^[0-9]+$ ]] || ((CATW < 1)); }; then
-    CATW=""
+
+# Width in columns: an explicit @catwalk-width / CATWALK_WIDTH wins for the
+# whole pool; otherwise each GIF derives its own from @catwalk-height and its
+# own proportions, so a tall thin bird and a long low cat both stay themselves.
+# RATIO is a terminal cell's height/width (8x16 fonts 2.0, this Konsole 26/11);
+# tune @catwalk-cell-ratio if the critters look squished or skinny.
+CATW_OPT="$(catcfg CATWALK_WIDTH catwalk-width '')"
+if [[ -n "$CATW_OPT" ]] && { [[ ! "$CATW_OPT" =~ ^[0-9]+$ ]] || ((CATW_OPT < 1)); }; then
+    CATW_OPT=""
 fi
-if [[ -z "$CATW" ]]; then
+RATIO=""
+if [[ -z "$CATW_OPT" ]]; then
     RATIO="$(catcfg CATWALK_CELL_RATIO catwalk-cell-ratio auto)"
     if [[ ! "$RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         # Taken from the *client's* cell, deliberately unlike CELLPX above:
-        # RATIO decides CATW, and a cat that came out a different number of
-        # columns from one window to the next would be worse than one that is
-        # a little off. Every window has to agree on this, so it cannot come
-        # from the per-window value.
+        # RATIO decides the column count, and a cat that came out a different
+        # number of columns from one window to the next would be worse than one
+        # that is a little off. Every window has to agree on this, so it cannot
+        # come from the per-window value.
         RATIO="$(awk -v p="$(catclientcell "${TMUX_PANE:-}")" \
             'BEGIN{ n=split(p,a,/[xX]/); if (n==2 && a[1]>0 && a[2]>0) printf "%.4f", a[2]/a[1] }')"
     fi
     [[ "$RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$RATIO" != 0 ]] || RATIO=2.4
-    IFS=, read -r GW GH < <(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$GIF" 2>/dev/null || true)
-    if [[ "$GW" =~ ^[0-9]+$ && "$GH" =~ ^[0-9]+$ && "$GH" -gt 0 ]]; then
-        CATW="$(awk -v h="$HEIGHT_ROWS" -v w="$GW" -v gh="$GH" -v r="$RATIO" 'BEGIN{ x=int(h*w*r/gh+0.5); print (x>0?x:1) }')"
-    else
-        CATW="28"
-    fi
 fi
 
 # --- animation --------------------------------------------------------------
-STEP="$(catcfg CATWALK_STEP catwalk-step 1)" # cells to advance per tick
-[[ "$STEP" =~ ^[0-9]+$ ]] && ((STEP > 0)) || STEP=1
-DIRECTION="$(catcfg CATWALK_DIRECTION catwalk-direction rtl)" # ltr or rtl
-[[ "$DIRECTION" == "ltr" || "$DIRECTION" == "rtl" ]] || DIRECTION=rtl
+# Cells advanced per tick. A bare number is a fixed gait, as before; MIN-MAX
+# gives the spawner a range to draw each critter's speed from.
+#
+# Speeds are kept in *tenths* of a cell throughout, and the option is read at
+# that resolution too - `0.5` is half a cell a tick. A whole cell per tick is a
+# brisk walk (at the default 10fps it crosses a 170-column pane in 17 seconds)
+# and used to be the slowest gait available, which left no way to ask for an
+# amble; decimals are how you get one.
+STEP_SPEED=10
+# stepspeed <value> - set STEP_SPEED to <value> in tenths, or return 1. Anything
+# past the first decimal place is dropped rather than rounded, so a stray `0.04`
+# is caught by the zero check below instead of silently becoming a real speed.
+stepspeed() {
+    local w f
+    if [[ "$1" =~ ^([0-9]+)$ ]]; then
+        STEP_SPEED=$((10#${BASH_REMATCH[1]} * 10))
+        return 0
+    fi
+    if [[ "$1" =~ ^([0-9]*)\.([0-9])[0-9]*$ ]]; then
+        w="${BASH_REMATCH[1]}"
+        f="${BASH_REMATCH[2]}"
+        STEP_SPEED=$((10#0$w * 10 + 10#$f))
+        return 0
+    fi
+    return 1
+}
+STEP="$(catcfg CATWALK_STEP catwalk-step 1)"
+SPEED_MIN=10
+SPEED_MAX=10
+if [[ "$STEP" == *-* ]] && stepspeed "${STEP%%-*}"; then
+    SPEED_MIN=$STEP_SPEED
+    stepspeed "${STEP##*-}" && SPEED_MAX=$STEP_SPEED || SPEED_MAX=$SPEED_MIN
+elif stepspeed "$STEP"; then
+    SPEED_MIN=$STEP_SPEED
+    SPEED_MAX=$STEP_SPEED
+fi
+((SPEED_MIN > 0)) || SPEED_MIN=10
+((SPEED_MAX >= SPEED_MIN)) || SPEED_MAX=$SPEED_MIN
+
+DIRECTION="$(catcfg CATWALK_DIRECTION catwalk-direction rtl)" # ltr, rtl, random
+case "$DIRECTION" in ltr | rtl | random) ;; *) DIRECTION=rtl ;; esac
 FPS="$(catcfg CATWALK_FPS catwalk-fps 10)"
 # FPS divides into the frame period below, and a 0 (or a typo) there used to
 # leave the sleep argument empty, which failed instantly on every iteration and
 # turned the loop into an unthrottled busy spin. Validate before dividing.
 [[ "$FPS" =~ ^[0-9]+$ ]] && ((FPS > 0)) || FPS=10
 
-# Target sixel canvas in pixels: exactly CATW x HEIGHT_ROWS terminal cells.
-TGT_W=$((CATW * CELLW))
+# The artwork's own facing, which decides who gets mirrored. A per-file
+# `name.ltr.gif` overrides it (catfacing).
+FACING="$(catcfg CATWALK_FACING catwalk-facing rtl)"
+[[ "$FACING" == "ltr" ]] || FACING=rtl
+MIRROR="$(catcfg CATWALK_MIRROR catwalk-mirror 1)"
+[[ "$MIRROR" == "0" ]] && MIRROR=0 || MIRROR=1
+
+# --- the spawner ------------------------------------------------------------
+# A spawn *slot* is a chance for a critter to be born. Each slot may or may not
+# take it (DENSITY), and a critter outlives its slot by however long it takes to
+# walk the pane, so several slots' worth are on screen together.
+#
+# MAXCATS is how many should be on the pane on average: it sets the spawn rate
+# (see update_geom), not a hard ceiling. It deliberately is not a ceiling. A
+# ceiling can only be enforced by turning critters away, and a critter turned
+# away has to stay away for its whole crossing - decide it afresh each tick and
+# it pops into existence halfway across the strip the moment room appears. The
+# rules that decide that at birth instead are either far too pessimistic (size
+# every lane for the slowest crossing a critter could possibly make, which with
+# speeds spread over @catwalk-step leaves one animal on screen almost all the
+# time) or unstable (ask whether the lane's last occupant has left, and the
+# answer depends on a chain of earlier such answers that never settles). So the
+# count is left to vary around MAXCATS instead, which is what it does naturally.
+MAXCATS="$(catcfg CATWALK_MAX_CATS catwalk-max-cats 3)"
+[[ "$MAXCATS" =~ ^[0-9]+$ ]] && ((MAXCATS > 0)) || MAXCATS=3
+# Normally the spawn interval follows from MAXCATS - ask for three critters and
+# they are born as often as three critters requires - and the two knobs would
+# fight if both were live. A number here pins the interval instead and MAXCATS
+# stops deciding anything; `auto`, the default, leaves it to MAXCATS.
+SPAWN_SECS="$(catcfg CATWALK_SPAWN catwalk-spawn auto)"
+[[ "$SPAWN_SECS" =~ ^[0-9]+$ ]] && ((SPAWN_SECS > 0)) || SPAWN_SECS=0
+DENSITY="$(catcfg CATWALK_DENSITY catwalk-density 70)"
+[[ "$DENSITY" =~ ^[0-9]+$ ]] && ((DENSITY <= 100)) || DENSITY=70
+# LANES is how many critters can be walking at once - enough that a lane is
+# always clear before it comes round again, which is what makes the lane
+# arithmetic collision-free. It follows from the crossing time and the spawn
+# rate rather than from MAXCATS, and is worked out in update_geom along with
+# everything else that depends on the pane width. These are safe values for
+# before the first call.
+LANES=1
+SLOT_TICKS=$((FPS * SPAWN_SECS))
+((SLOT_TICKS > 0)) || SLOT_TICKS=1
+DELAY_SPAN=1
+LOOKBACK=2
+# The most lanes worth drawing. Only a pathologically short @catwalk-spawn gets
+# near it, and SLOT_TICKS is raised to keep within it rather than the cap being
+# allowed to break the no-collision guarantee.
+LANES_MAX=16
+
+# Target canvas height in pixels: exactly HEIGHT_ROWS terminal cells. The kitty
+# strip is exactly HEIGHT_ROWS tall - it needs no clearance row, because an image
+# that never passes through tmux cannot scroll the screen - so the top padding
+# has to come out of the cat rather than out of the row below it. Take it off
+# both dimensions, so the cat comes out a touch smaller instead of squashed, and
+# the padded image lands inside the strip to the pixel.
 TGT_H=$((HEIGHT_ROWS * CELLH))
-# The kitty strip is exactly HEIGHT_ROWS tall - it needs no clearance row,
-# because an image that never passes through tmux cannot scroll the screen - so
-# the top padding has to come out of the cat rather than out of the row below
-# it. Take it off both dimensions, so the cat comes out a touch smaller instead
-# of squashed, and the padded image lands inside the strip to the pixel.
+TGT_H_FULL=$TGT_H
+KITTY_SHRINK=0
 if [[ "$MODE" == "kitty" ]] && ((TOPPAD > 0)) && ((TGT_H > TOPPAD * 6)); then
+    KITTY_SHRINK=1
     TGT_H=$((TGT_H - TOPPAD * 6))
-    TGT_W=$((TGT_W * TGT_H / (HEIGHT_ROWS * CELLH)))
-    ((TGT_W > 0)) || TGT_W=1
-fi
-FILL_OPTS=("--top-pad" "$TOPPAD")
-COVER_OPTS=()
-if ((TGT_W > 0 && TGT_H > 0)); then
-    FILL_OPTS+=("--target" "${TGT_W}x${TGT_H}")
-    COVER_OPTS=("--target" "${TGT_W}x${TGT_H}")
 fi
 
 # Sixel channel values (0-100) for the background fill. Only the sixel path
@@ -143,6 +239,8 @@ if [[ "$BG" =~ ^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$ ]]; then
         "$((16#${BASH_REMATCH[3]} * 100 / 255))"
     )
 fi
+HAVE_COVER=0
+((${#BGR_BGR[@]} == 3)) && HAVE_COVER=1
 
 # --- dependencies -----------------------------------------------------------
 require_cmd ffmpeg || die "ffmpeg is required (gif frame extraction)"
@@ -156,8 +254,80 @@ if [[ "$MODE" == "sixel" ]]; then
 else
     require_cmd base64 || die "base64 is required (kitty graphics transmission)"
 fi
-[[ -n "$GIF" ]] || die "@catwalk-gif is not set"
-[[ -f "$GIF" ]] || die "no cat image at $GIF (set @catwalk-gif)"
+[[ -n "$GIFSRC" ]] || die "@catwalk-gif is not set"
+if ((NGIFS == 0)); then
+    [[ -d "$GIFSRC" ]] && die "no .gif files in $GIFSRC"
+    die "no cat image at $GIFSRC (set @catwalk-gif)"
+fi
+((SPAWN)) || [[ -f "${POOL[0]}" ]] || die "no cat image at $GIFSRC (set @catwalk-gif)"
+
+# --- per-GIF geometry -------------------------------------------------------
+# Each GIF gets its own column width and therefore its own scale target. The
+# md5 of the file is the head of its cache key, so two GIFs can never collide -
+# and neither can two *variants* of one GIF (see prepare_variant).
+declare -a GIF_FACING=() GIF_CATW=() GIF_TGTW=() GIF_MD5=()
+for ((g = 0; g < NGIFS; g++)); do
+    GIF_FACING[g]="$(catfacing "${POOL[g]}" "$FACING")"
+    GIF_MD5[g]="$(md5sum "${POOL[g]}" 2>/dev/null | cut -d' ' -f1)"
+    [[ -n "${GIF_MD5[g]}" ]] || die "cannot read ${POOL[g]}"
+    w="$CATW_OPT"
+    if [[ -z "$w" ]]; then
+        IFS=, read -r GW GH < <(ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height -of csv=p=0 "${POOL[g]}" 2>/dev/null || true)
+        if [[ "${GW:-}" =~ ^[0-9]+$ && "${GH:-}" =~ ^[0-9]+$ ]] && ((GH > 0)); then
+            w="$(awk -v h="$HEIGHT_ROWS" -v ww="$GW" -v gh="$GH" -v r="$RATIO" \
+                'BEGIN{ x=int(h*ww*r/gh+0.5); print (x>0?x:1) }')"
+        else
+            w=28
+        fi
+    fi
+    GIF_CATW[g]="$w"
+    tw=$((w * CELLW))
+    if ((KITTY_SHRINK)); then
+        tw=$((tw * TGT_H / TGT_H_FULL))
+        ((tw > 0)) || tw=1
+    fi
+    GIF_TGTW[g]="$tw"
+done
+
+# --- render state -----------------------------------------------------------
+# A *variant* is one GIF walking one way: v = 2*g + flip, where flip means the
+# frames were mirrored so the artwork faces its direction of travel. Both halves
+# are rendered when directions are random; otherwise only the one that can occur.
+#
+# Frame payloads live in flat arrays indexed through VAR_OFF, which is how bash
+# does an array of arrays. Everything here is declared before the duplicate
+# check below, because that path can reach kitty_clear and an unset name under
+# `set -u` would abort the teardown mid-way.
+declare -a VAR_DIR=() VAR_N=() VAR_OFF=() VAR_IDBASE=() VAR_LOADED=()
+declare -a VAR_TX=() VAR_COVER=()
+declare -a SIXFILE=() SIXDATA=() COVERDATA=()
+SIX_TOTAL=0
+
+# Lanes: one drawing slot per simultaneously visible critter. Lane ownership is
+# arithmetic - the critter born in spawn slot k walks in lane k % LANES - and
+# there are enough lanes that one is always clear before it comes round again
+# (see update_geom). Each lane remembers what it last put on the glass, which is
+# what the next frame's placement delete, or cover strip, has to undo.
+declare -a LANE_LIVE=() LANE_PREVX=() LANE_PREVVAR=()
+declare -a LANE_PID=() LANE_PREV_ID=() LANE_PREV_PID=()
+# init_lanes - (re)build the lane bookkeeping for the current LANES. Called
+# again whenever a resize changes how many lanes the pane needs; the caller
+# repaints, so nothing is left on the glass under the old numbering.
+init_lanes() {
+    local i
+    LANE_LIVE=(); LANE_PREVX=(); LANE_PREVVAR=()
+    LANE_PID=(); LANE_PREV_ID=(); LANE_PREV_PID=()
+    for ((i = 0; i < LANES; i++)); do
+        LANE_LIVE[i]=-1
+        LANE_PREVX[i]=-1
+        LANE_PREVVAR[i]=-1
+        LANE_PID[i]=$((2 * i + 1))
+        LANE_PREV_ID[i]=""
+        LANE_PREV_PID[i]=""
+    done
+}
+init_lanes
 
 # --- pane identity ----------------------------------------------------------
 # Stamp this pane so every other script can find its cats without pattern
@@ -204,14 +374,12 @@ sixel_discard() {
 # concerned, which is why the position has to be absolute: tty_cmd_rawstring is
 # tty_add() plus tty_invalidate() and never moves the cursor for us.
 #
-# Placement ids alternate between 1 and 2. Deleting the previous placement by
-# *image* id alone would delete the frame just drawn whenever two consecutive
-# ticks reuse one image - which is every tick of a single-frame GIF. Konsole
-# matches on both ids (Screen::delPlacements), so alternating keeps the place
-# and the delete disjoint in every case.
-KITTY_PID=1
-KITTY_PREV_PID=""
-KITTY_PREV_ID=""
+# Placement ids alternate within a lane, between 2*lane+1 and 2*lane+2. Deleting
+# the previous placement by *image* id alone would delete the frame just drawn
+# whenever two consecutive ticks reuse one image - which is every tick of a
+# single-frame GIF. Konsole matches on both ids (Screen::delPlacements), so
+# alternating keeps the place and the delete disjoint in every case, and giving
+# each lane its own pair keeps one critter's delete off another's placement.
 # 6px bands of headroom become a true sub-cell pixel offset here; Konsole
 # computes y = row * fontHeight + Y.
 KITTY_YPAD=$((TOPPAD * 6))
@@ -221,36 +389,23 @@ kitty_pass() {
     printf '\033Ptmux;%s\033\\' "${1//$'\033'/$'\033\033'}"
 }
 
-# kitty_place <x> <idx> - draw frame idx at pane column x (0-indexed).
-# The cursor move and the placement go out in one payload so nothing of tmux's
-# own can interleave and move the cursor between them; the delete rides along
-# too, which means one repaint per tick and therefore no flicker.
-kitty_place() {
-    local raw id
-    id=$((ID_BASE + $2))
-    printf -v raw '\033[%d;%dH\033_Ga=p,i=%d,p=%d,C=1,q=2,Y=%d\033\\' \
-        "$((ABS_ROW + ROW - 1))" "$((ABS_COL + $1))" \
-        "$id" "$KITTY_PID" "$KITTY_YPAD"
-    if [[ -n "$KITTY_PREV_PID" ]]; then
-        printf -v raw '%s\033_Ga=d,d=i,i=%d,p=%d\033\\' \
-            "$raw" "$KITTY_PREV_ID" "$KITTY_PREV_PID"
-    fi
-    kitty_pass "$raw"
-    KITTY_PREV_ID=$id
-    KITTY_PREV_PID=$KITTY_PID
-    KITTY_PID=$((KITTY_PID == 1 ? 2 : 1))
-}
-
 # kitty_clear - drop every placement of ours. Deliberately not d=a, which would
 # take out every visible placement in the terminal, including other programs'.
+# Only *loaded* variants can have anything on the glass, so only their id ranges
+# are worth the escapes.
 kitty_clear() {
-    local i raw=""
-    for ((i = 0; i < N; i++)); do
-        printf -v raw '%s\033_Ga=d,d=i,i=%d\033\\' "$raw" "$((ID_BASE + i))"
+    local v i raw=""
+    for v in "${!VAR_LOADED[@]}"; do
+        ((${VAR_LOADED[v]})) || continue
+        for ((i = 0; i < ${VAR_N[v]}; i++)); do
+            printf -v raw '%s\033_Ga=d,d=i,i=%d\033\\' "$raw" "$((${VAR_IDBASE[v]} + i))"
+        done
     done
     kitty_pass "$raw"
-    KITTY_PREV_PID=""
-    KITTY_PREV_ID=""
+    for ((i = 0; i < LANES; i++)); do
+        LANE_PREV_ID[i]=""
+        LANE_PREV_PID[i]=""
+    done
 }
 
 # discard_graphics - remove what we painted, whichever way we painted it. The
@@ -271,6 +426,7 @@ discard_graphics() {
 # us the frame we last painted stays on the glass; these let us react to that.
 WIN_ACTIVE=1
 ZOOM_HIDDEN=0
+NEED_BG=1
 
 # pane_alone_or_duplicate - non-zero when this cat should bow out: either it is
 # the only pane left in the window (let the window close), or another cat pane
@@ -343,73 +499,139 @@ FRAME_US=$((1000000 / FPS))
 ((FRAME_US > 0)) || FRAME_US=100000
 
 # --- cache ------------------------------------------------------------------
-# Cache key includes render size, background color and top padding so changing
-# @catwalk-width/height, the terminal theme or the padding re-renders instead of
-# reusing stale frames.
-KEY="$(md5sum "$GIF" 2>/dev/null | cut -d' ' -f1)-${CATW}x${HEIGHT_ROWS}"
-[[ -n "$BG" ]] && KEY="${KEY}-${BG#\#}"
-# bump when the post-processing changes so cached frames re-render
-KEY="${KEY}-f9-${MODE}-${CELLW}x${CELLH}-p${TOPPAD}"
-SIX_DIR="$CACHE/$KEY"
-
-# Kitty image ids are derived from the cache key, so every cat rendering the
-# same frames addresses the terminal's single copy of them, and a different GIF
-# or size can never land on another's ids. Frame N is ID_BASE+N.
-if [[ "$MODE" == "kitty" ]]; then
-    ID_BASE="$(python3 "$SCRIPT_DIR/catkitty.py" idbase "$KEY" 2>/dev/null)"
-    [[ "$ID_BASE" =~ ^[0-9]+$ ]] || ID_BASE=1048576
-fi
-mkdir -p "$SIX_DIR" || die "cannot create cache dir $SIX_DIR"
-
-# Every window's cat starts at once and they all share this cache directory, so
+# Every window's cats start at once and they all share this cache directory, so
 # populating it has to be serialised: otherwise one cat's `rm -rf` lands in the
 # middle of another's ffmpeg run, and half-written .six files get catted
 # straight to the terminal.
 LOCK_FD=""
 if require_cmd flock; then
+    mkdir -p "$CACHE" 2>/dev/null
     exec 9>"$CACHE/.lock" && LOCK_FD=9
     [[ -n "$LOCK_FD" ]] && flock 9 2>/dev/null
 fi
 
-# Prune stale cache dirs by age, not by "everything that is not mine". The key
-# includes the cell geometry, and two windows can legitimately disagree about
-# what a cell is (see CELLPX above), so each would have wiped the other's frames
-# on every pass -- an endless ffmpeg/chafa loop between two live cats. Touching
-# our own dir on each start is what keeps it out of the sweep.
-touch "$SIX_DIR" 2>/dev/null
-if [[ -n "$CACHE" && -d "$CACHE" ]] && require_cmd find; then
-    find "$CACHE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null
-fi
+# prepare_variant <gif-index> <flip> - make sure one variant's frames exist on
+# disk and record where they are. Extraction and sixel encoding happen here,
+# once, under the lock; the payloads are not read into memory until the variant
+# is first seen on screen (load_variant), so a directory of thirty GIFs costs
+# thirty cache dirs but only ever a handful of frame sets in this process.
+#
+# Cache key includes render size, background colour, padding and the mirror flag
+# so changing @catwalk-width/height, the terminal theme or the direction
+# re-renders instead of reusing stale frames.
+prepare_variant() {
+    local g="$1" flip="$2" v key dir vf out png i n
+    local -a pngs=()
+    v=$((g * 2 + flip))
+    [[ -n "${VAR_DIR[v]:-}" ]] && return 0
 
-# extract frames once
-if ! ls "$SIX_DIR"/f*.png >/dev/null 2>&1; then
-    rm -rf "$SIX_DIR"
-    mkdir -p "$SIX_DIR"
-    ffmpeg -y -loglevel error -i "$GIF" -vf "scale=${TGT_W}:${TGT_H}" "$SIX_DIR/f%03d.png" 2>/dev/null || true
-fi
+    key="${GIF_MD5[g]}-${GIF_CATW[g]}x${HEIGHT_ROWS}"
+    [[ -n "$BG" ]] && key="${key}-${BG#\#}"
+    # bump when the post-processing changes so cached frames re-render
+    key="${key}-f10-${MODE}-${CELLW}x${CELLH}-p${TOPPAD}"
+    ((flip)) && key="${key}-flip"
+    dir="$CACHE/$key"
+    mkdir -p "$dir" || die "cannot create cache dir $dir"
+    # Touching our own dirs on each start is what keeps them out of the prune
+    # sweep below.
+    touch "$dir" 2>/dev/null
 
-mapfile -t PNGS < <(ls -1 "$SIX_DIR"/f*.png 2>/dev/null | sort)
-N="${#PNGS[@]}"
-((N > 0)) || die "could not extract frames from $GIF"
+    if ! ls "$dir"/f*.png >/dev/null 2>&1; then
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        vf="scale=${GIF_TGTW[g]}:${TGT_H}"
+        # One hflip is the whole of mirroring: a critter walking against the way
+        # its artwork faces would otherwise moonwalk across the pane.
+        ((flip)) && vf="${vf},hflip"
+        ffmpeg -y -loglevel error -i "${POOL[g]}" -vf "$vf" "$dir/f%03d.png" 2>/dev/null || true
+    fi
 
-# Pre-render every frame to sixel. Fail loudly instead of silently blanking.
-# The chafa output is built under a temporary name and moved into place, so a
-# peer sharing this cache never reads a partially written frame.
+    mapfile -t pngs < <(ls -1 "$dir"/f*.png 2>/dev/null | sort)
+    n="${#pngs[@]}"
+    ((n > 0)) || die "could not extract frames from ${POOL[g]}"
+
+    VAR_DIR[v]="$dir"
+    VAR_N[v]="$n"
+    VAR_OFF[v]=$SIX_TOTAL
+    VAR_LOADED[v]=0
+    VAR_TX[v]=""
+    VAR_COVER[v]=""
+    SIX_TOTAL=$((SIX_TOTAL + n))
+
+    # Kitty image ids are derived from the cache key, so every cat rendering the
+    # same frames addresses the terminal's single copy of them, and a different
+    # GIF, size or mirroring can never land on another's ids. Frame N is
+    # IDBASE+N.
+    if [[ "$MODE" == "kitty" ]]; then
+        VAR_IDBASE[v]="$(python3 "$SCRIPT_DIR/catkitty.py" idbase "$key" 2>/dev/null)"
+        [[ "${VAR_IDBASE[v]}" =~ ^[0-9]+$ ]] || VAR_IDBASE[v]=1048576
+        # One blob holding the chunked transmission of every frame, built once.
+        # Konsole keeps transmitted frames in _graphicsImages for the life of the
+        # terminal, so each tick afterwards costs two short escape sequences
+        # instead of a whole image.
+        VAR_TX[v]="$dir/kitty-tx.esc"
+        if [[ ! -f "${VAR_TX[v]}" ]]; then
+            if python3 "$SCRIPT_DIR/catkitty.py" transmit "${VAR_TX[v]}.tmp.$$" \
+                "${VAR_IDBASE[v]}" "${pngs[@]}" 2>/dev/null; then
+                mv -f "${VAR_TX[v]}.tmp.$$" "${VAR_TX[v]}"
+            else
+                rm -f "${VAR_TX[v]}.tmp.$$"
+                die "could not build the kitty transmission for ${POOL[g]}"
+            fi
+        fi
+        return 0
+    fi
+
+    VAR_IDBASE[v]=0
+    i=0
+    for png in "${pngs[@]}"; do
+        out="${png%.png}.six"
+        render_sixel "$png" "$out" "${GIF_CATW[g]}" "${GIF_TGTW[g]}" ||
+            die "chafa failed to render ${png##*/}"
+        SIXFILE[VAR_OFF[v] + i]="$out"
+        i=$((i + 1))
+    done
+
+    # One opaque background-coloured rectangle the size of this variant's frame,
+    # used to erase the critter's previous position. Newer sixel placements draw
+    # on top of older ones on Konsole (KDE bug 456354), so a cover drawn over the
+    # old position hides the previous frame; every older cover is the terminal
+    # background colour and therefore invisible.
+    if ((HAVE_COVER)) && [[ -f "${SIXFILE[VAR_OFF[v]]}" ]]; then
+        VAR_COVER[v]="$dir/cover.six"
+        if [[ ! -f "${VAR_COVER[v]}" ]]; then
+            if python3 "$SCRIPT_DIR/sixelfill.py" cover "${SIXFILE[VAR_OFF[v]]}" \
+                "${VAR_COVER[v]}.tmp.$$" \
+                "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" \
+                --target "${GIF_TGTW[g]}x${TGT_H}" 2>/dev/null; then
+                mv -f "${VAR_COVER[v]}.tmp.$$" "${VAR_COVER[v]}"
+            else
+                rm -f "${VAR_COVER[v]}.tmp.$$"
+                VAR_COVER[v]=""
+            fi
+        fi
+    fi
+    return 0
+}
+
+# Pre-render one frame to sixel. Fail loudly instead of silently blanking. The
+# chafa output is built under a temporary name and moved into place, so a peer
+# sharing this cache never reads a partially written frame.
 render_sixel() {
-    local png="$1" out="$2" tmp bg_opt=()
+    local png="$1" out="$2" catw="$3" tgtw="$4" tmp bg_opt=()
     [[ -f "$out" ]] && return 0
     [[ -n "$BG" ]] && bg_opt=(--bg="$BG")
     tmp="$out.tmp.$$"
-    chafa --format=sixel --size="${CATW}x${HEIGHT_ROWS}" --exact-size=on "${bg_opt[@]}" "$png" >"$tmp" 2>/dev/null || {
+    chafa --format=sixel --size="${catw}x${HEIGHT_ROWS}" --exact-size=on "${bg_opt[@]}" "$png" >"$tmp" 2>/dev/null || {
         rm -f "$tmp"
         return 1
     }
     # Paint an opaque background under the cat so the terminal's sixel canvas
     # fill (usually a colored slab) never shows through.
-    if ((${#BGR_BGR[@]} == 3)); then
+    if ((HAVE_COVER)); then
         if python3 "$SCRIPT_DIR/sixelfill.py" fill "$tmp" "$tmp.f" \
             "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" \
-            "${FILL_OPTS[@]}" 2>/dev/null; then
+            --top-pad "$TOPPAD" --target "${tgtw}x${TGT_H}" 2>/dev/null; then
             mv -f "$tmp.f" "$tmp"
         else
             rm -f "$tmp.f"
@@ -427,49 +649,28 @@ render_sixel() {
     mv -f "$tmp" "$out"
 }
 
-declare -a SIX
-KITTY_TX=""
-if [[ "$MODE" == "kitty" ]]; then
-    # One blob holding the chunked transmission of every frame, built once and
-    # printed once at startup. Konsole keeps transmitted frames in
-    # _graphicsImages for the life of the terminal, so each tick afterwards
-    # costs two short escape sequences instead of a whole image.
-    KITTY_TX="$SIX_DIR/kitty-tx.esc"
-    if [[ ! -f "$KITTY_TX" ]]; then
-        if python3 "$SCRIPT_DIR/catkitty.py" transmit "$KITTY_TX.tmp.$$" \
-            "$ID_BASE" "${PNGS[@]}" 2>/dev/null; then
-            mv -f "$KITTY_TX.tmp.$$" "$KITTY_TX"
-        else
-            rm -f "$KITTY_TX.tmp.$$"
-            die "could not build the kitty transmission for $GIF"
-        fi
+# Which variants can actually occur. Randomised directions mean any GIF may walk
+# either way, so both halves are rendered; a fixed direction needs only the one.
+for ((g = 0; g < NGIFS; g++)); do
+    if [[ "$DIRECTION" == "random" ]] && ((MIRROR)); then
+        prepare_variant "$g" 0
+        prepare_variant "$g" 1
+    elif [[ "$DIRECTION" == "random" ]]; then
+        prepare_variant "$g" 0
+    else
+        flip=0
+        [[ "$DIRECTION" != "${GIF_FACING[g]}" ]] && ((MIRROR)) && flip=1
+        prepare_variant "$g" "$flip"
     fi
-else
-    for png in "${PNGS[@]}"; do
-        out="${png%.png}.six"
-        render_sixel "$png" "$out" || die "chafa failed to render $(basename "$png")"
-        SIX+=("$out")
-    done
-fi
+done
 
-# One opaque background-colored rectangle (same size as a frame) used to erase
-# the previous cat. Newer sixel placements draw on top of older ones on Konsole
-# (KDE bug 456354), so a cover drawn over the old position hides the previous
-# frame and only the newest cat stays visible; every older cover is the
-# terminal background color and therefore invisible.
-COVER=""
-if [[ "$MODE" == "sixel" ]] && ((${#BGR_BGR[@]} == 3)) && [[ -f "${SIX[0]}" ]]; then
-    COVER="$SIX_DIR/cover.six"
-    if [[ ! -f "$COVER" ]]; then
-        if python3 "$SCRIPT_DIR/sixelfill.py" cover "${SIX[0]}" "$COVER.tmp.$$" \
-            "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" \
-            "${COVER_OPTS[@]}" 2>/dev/null; then
-            mv -f "$COVER.tmp.$$" "$COVER"
-        else
-            rm -f "$COVER.tmp.$$"
-            COVER=""
-        fi
-    fi
+# Prune stale cache dirs by age, not by "everything that is not mine". The key
+# includes the cell geometry, and two windows can legitimately disagree about
+# what a cell is (see CELLPX above), so each would have wiped the other's frames
+# on every pass -- an endless ffmpeg/chafa loop between two live cats. Done after
+# the render pass, so everything this run touched is fresh.
+if [[ -n "$CACHE" && -d "$CACHE" ]] && require_cmd find; then
+    find "$CACHE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null
 fi
 
 if [[ -n "$LOCK_FD" ]]; then
@@ -477,20 +678,26 @@ if [[ -n "$LOCK_FD" ]]; then
     exec 9>&-
 fi
 
-# Hold the sixel payloads in memory. Forking `cat` for every frame (plus the
-# cover) meant ~40 processes a second per window; a bash string costs nothing.
-declare -a SIXDATA
-for out in "${SIX[@]}"; do
-    SIXDATA+=("$(<"$out")")
-done
-COVERDATA=""
-[[ -n "$COVER" && -f "$COVER" ]] && COVERDATA="$(<"$COVER")"
-
-KITTY_TXDATA=""
-if [[ "$MODE" == "kitty" ]]; then
-    [[ -f "$KITTY_TX" ]] && KITTY_TXDATA="$(<"$KITTY_TX")"
-    [[ -n "$KITTY_TXDATA" ]] || die "the kitty transmission for $GIF is empty"
-fi
+# load_variant <v> - bring one variant's payloads into this process, the first
+# time it is about to be drawn. Forking `cat` for every frame meant ~40 processes
+# a second per window; a bash string costs nothing. On the kitty path this is
+# where the terminal is handed the frames, once.
+load_variant() {
+    local v="$1" i
+    ((${VAR_LOADED[v]})) && return 0
+    VAR_LOADED[v]=1
+    if [[ "$MODE" == "kitty" ]]; then
+        [[ -f "${VAR_TX[v]}" ]] || die "the kitty transmission for variant $v is missing"
+        printf '%s' "$(<"${VAR_TX[v]}")"
+        return 0
+    fi
+    for ((i = 0; i < ${VAR_N[v]}; i++)); do
+        SIXDATA[${VAR_OFF[v]} + i]="$(<"${SIXFILE[${VAR_OFF[v]} + i]}")"
+    done
+    COVERDATA[v]=""
+    [[ -n "${VAR_COVER[v]}" && -f "${VAR_COVER[v]}" ]] && COVERDATA[v]="$(<"${VAR_COVER[v]}")"
+    return 0
+}
 
 # --- geometry ---------------------------------------------------------------
 # Everything that can change under us in one tmux round-trip: the pane's size,
@@ -517,7 +724,7 @@ update_abs_origin() {
 }
 
 update_geom() {
-    local geom pw ph cw ch eff fmt strip
+    local geom pw ph cw ch eff fmt strip m mx
     # cw/ch must be the *same* measure the frames were baked to (CELLW/CELLH
     # above), because the re-render check at the end compares the two. Reading
     # the window's cell here while the kitty path bakes to the client's would
@@ -533,8 +740,67 @@ update_geom() {
     PANEW="$pw"
     [[ "$PANEW" =~ ^[0-9]+$ ]] || PANEW="$(stty size 2>/dev/null | awk '{print $2}')"
     [[ "$PANEW" =~ ^[0-9]+$ ]] || PANEW=1
-    MAXX=$((PANEW - CATW))
-    ((MAXX < 1)) && MAXX=1
+    # The widest crossing any critter in the pool has to make. Each has its own,
+    # since each has its own width; this one only sizes the lookback.
+    MAXX=1
+    for ((m = 0; m < NGIFS; m++)); do
+        mx=$((PANEW - ${GIF_CATW[m]}))
+        ((mx < 1)) && mx=1
+        ((mx > MAXX)) && MAXX=$mx
+    done
+    # How long a crossing takes: MAX_CROSS at the slowest speed @catwalk-step
+    # allows, AVG_CROSS averaged over the range.
+    #
+    # AVG_CROSS is deliberately not the crossing at the average speed. Time is
+    # distance over speed, and averaging 1/speed is not the same as one over the
+    # average speed - it is always larger, and for a 1-3 range by a tenth. Using
+    # the cheap version made the strip about a tenth busier than asked for.
+    # Simpson's rule over 1/speed, scaled by a million to stay in integers, is
+    # within a per cent of the real mean and costs no fork.
+    MAX_CROSS=$((MAXX * 10 / SPEED_MIN))
+    SPEED_MID=$(((SPEED_MIN + SPEED_MAX) / 2))
+    ((SPEED_MID > 0)) || SPEED_MID=$SPEED_MIN
+    INV_SPEED=$(((1000000 / SPEED_MIN + 4000000 / SPEED_MID + 1000000 / SPEED_MAX) / 6))
+    AVG_CROSS=$((MAXX * 10 * INV_SPEED / 1000000))
+    ((AVG_CROSS > 0)) || AVG_CROSS=1
+    # Spawn often enough to keep MAXCATS of them walking: with one born every
+    # SLOT_TICKS, DENSITY per cent of the time, each staying AVG_CROSS ticks,
+    # the pane holds AVG_CROSS * DENSITY / (100 * SLOT_TICKS) at a time - so
+    # solving that for the number wanted gives the interval. DENSITY cancels out
+    # of the average, which is the point: it decides how bunched up the arrivals
+    # are, not how many there are.
+    #
+    # The number aimed for is two thirds of MAXCATS rather than all of it. The
+    # count varies around whatever it is aimed at, so aiming at three would put
+    # four or more on the strip a third of the time and MAXCATS would be a lie;
+    # aiming a third lower leaves it reading as what it is called, the busiest
+    # the strip usually gets. Rounded rather than truncated - at these sizes
+    # truncation alone was worth a tenth of a critter.
+    SLOT_TICKS=$(((3 * AVG_CROSS * DENSITY + 100 * MAXCATS) / (200 * MAXCATS)))
+    # An explicit @catwalk-spawn pins the interval instead.
+    ((SPAWN_SECS > 0)) && SLOT_TICKS=$((FPS * SPAWN_SECS))
+    # ... and a floor that keeps the lane count inside LANES_MAX, so a silly
+    # @catwalk-spawn costs frequency rather than the no-collision guarantee.
+    ((SLOT_TICKS < MAX_CROSS / (LANES_MAX - 2) + 1)) &&
+        SLOT_TICKS=$((MAX_CROSS / (LANES_MAX - 2) + 1))
+    ((SLOT_TICKS > 0)) || SLOT_TICKS=1
+    # Entrances are jittered across the whole period, so they do not land on the
+    # beat. Slot k still always starts before slot k+1 - the jitter cannot reach
+    # past the end of its own period - which keeps the lane order well defined.
+    DELAY_SPAN=$SLOT_TICKS
+    # Lane k % LANES. A critter holds its lane for at most DELAY_SPAN+MAX_CROSS
+    # ticks and the lane comes round after LANES periods, so this many lanes
+    # means the lane is always clear: no critter is ever turned away, and none
+    # can appear anywhere but at the edge it walked in from.
+    LANES=$(((MAX_CROSS + DELAY_SPAN) / SLOT_TICKS + 2))
+    ((SPAWN)) || LANES=1
+    ((LANES > LANES_MAX)) && LANES=$LANES_MAX
+    if ((LANES != ${#LANE_LIVE[@]})); then
+        init_lanes
+        NEED_BG=1
+    fi
+    # How far back a critter that is still walking can have been born.
+    LOOKBACK=$((LANES + 1))
 
     PANEH="$ph"
     [[ "$PANEH" =~ ^[0-9]+$ ]] || PANEH=1
@@ -572,7 +838,7 @@ update_geom() {
     # here is the same one the new process reads to bake with.
     if ((CELL_AUTO)) && [[ "$cw" =~ ^[0-9]+$ && "$ch" =~ ^[0-9]+$ ]] &&
         ((cw > 0 && ch > 0)) && ((cw != CELLW || ch != CELLH)); then
-        # The replacement bakes to a new cache key, so a new ID_BASE: these
+        # The replacement bakes to new cache keys, so new id bases: these
         # placements would be orphaned where the sixel path's are simply
         # painted over. Take them down before handing off.
         [[ "$MODE" == "kitty" ]] && kitty_clear
@@ -589,7 +855,7 @@ update_geom() {
 BGDATA=""
 make_bg() {
     BGDATA=""
-    ((${#BGR_BGR[@]} == 3)) || return 0
+    ((HAVE_COVER)) || return 0
     local f tmp px py nb b rows
     # One row short of the pane, on purpose: tmux scales any sixel taller than
     # screen_size_y - 1 (screen-write.c), so a full-height strip was resampled
@@ -597,7 +863,9 @@ make_bg() {
     # give up is the cat's bottom clearance, which is never drawn into anyway.
     rows=$((PANEH - 1))
     ((rows < 1)) && rows=1
-    f="$SIX_DIR/bg-${PANEW}x${rows}.six"
+    mkdir -p "$CACHE/bg" 2>/dev/null
+    touch "$CACHE/bg" 2>/dev/null
+    f="$CACHE/bg/${PANEW}x${rows}-${CELLW}x${CELLH}-${BG#\#}.six"
     if [[ ! -f "$f" ]]; then
         px=$((PANEW * CELLW))
         py=$((rows * CELLH))
@@ -634,14 +902,10 @@ trap cleanup INT TERM HUP EXIT
 printf '\033[?25l'
 update_geom
 
-# Hand the terminal every frame, once. From here on a tick is two short escape
-# sequences rather than a whole image.
-[[ -n "$KITTY_TXDATA" ]] && printf '%s' "$KITTY_TXDATA"
-
-NEED_BG=1
 # A resize is the earliest notice we get that the last other pane went away:
 # this pane has to grow for that to happen. Ask the loop to re-check who is
 # left before it draws anything else.
+NEED_BG=1
 NEED_CHECK=0
 on_winch() {
     update_geom
@@ -650,6 +914,198 @@ on_winch() {
 }
 trap on_winch WINCH
 
+# --- the spawner ------------------------------------------------------------
+# cathash <n> - a deterministic 31-bit mix of one integer, in pure bash
+# arithmetic. This runs several times per frame, so it must not fork: the answer
+# comes back in HASH rather than on stdout. Each step is masked because bash
+# arithmetic is 64-bit *signed* and an unmasked right shift would sign-extend.
+HASH=0
+cathash() {
+    local h=$((($1 * 2654435761) & 0x7FFFFFFF))
+    h=$(((h ^ (h >> 15)) & 0x7FFFFFFF))
+    h=$(((h * 2246822519) & 0x7FFFFFFF))
+    HASH=$(((h ^ (h >> 13)) & 0x7FFFFFFF))
+}
+
+# slot_sprite <slot> - describe the critter born in that slot, or return 1 if
+# the slot is one of the empty ones. Every property is a different bit-field of
+# a single hash of the slot number, which is the whole trick: nothing is stored,
+# nothing is rolled, and any process at any time can reconstruct the same animal.
+SP_G=0
+SP_VAR=0
+SP_DIR=rtl
+SP_SPEED=10
+SP_T0=0
+SP_PHASE=0
+slot_sprite() {
+    local h flip
+    cathash "$1"
+    h=$HASH
+    # The gaps. Without them a crossing always overlaps the next spawn and the
+    # strip is never empty, which reads as a parade rather than as wildlife.
+    ((h % 100 < DENSITY)) || return 1
+    SP_G=$(((h >> 7) % NGIFS))
+    if [[ "$DIRECTION" == "random" ]]; then
+        (((h >> 15) & 1)) && SP_DIR=ltr || SP_DIR=rtl
+    else
+        SP_DIR="$DIRECTION"
+    fi
+    SP_SPEED=$((SPEED_MIN + (h >> 17) % (SPEED_MAX - SPEED_MIN + 1)))
+    # Offset within the slot, so entrances are not all on the beat. Capped at a
+    # quarter of the period; the rest of the period is the margin that keeps a
+    # lane clear (see update_geom).
+    SP_T0=$(($1 * SLOT_TICKS + (h >> 24) % DELAY_SPAN))
+    flip=0
+    [[ "$SP_DIR" != "${GIF_FACING[SP_G]}" ]] && ((MIRROR)) && flip=1
+    SP_VAR=$((SP_G * 2 + flip))
+    # so two of the same critter on screen at once are not in lockstep
+    SP_PHASE=$(((h >> 3) % ${VAR_N[SP_VAR]}))
+    return 0
+}
+
+# What is on the pane right now, indexed by lane. LANE_LIVE[i] is the slot
+# number of the critter in lane i, or -1 when the lane is empty.
+LIVE_VAR=()
+LIVE_X=()
+LIVE_IDX=()
+SP_TRAVEL=0
+SP_MAXX=1
+
+# sprite_alive_at <slot> <tick> - is the critter born in that slot on the pane at
+# that instant? Fills the SP_* fields on the way, including how far it has got.
+sprite_alive_at() {
+    slot_sprite "$1" || return 1
+    (($2 >= SP_T0)) || return 1
+    SP_MAXX=$((PANEW - ${GIF_CATW[SP_G]}))
+    ((SP_MAXX < 1)) && SP_MAXX=1
+    SP_TRAVEL=$((($2 - SP_T0) * SP_SPEED / 10))
+    # Walked off the far edge: this one is done and never comes back.
+    ((SP_TRAVEL <= SP_MAXX)) || return 1
+    return 0
+}
+
+# collect_live - who is on the pane at `steps`, filed by lane. Every critter born
+# in the last LOOKBACK slots is tried and the ones that have already walked off
+# fall out in sprite_alive_at. Nothing is turned away: LANES is sized so that no
+# two survivors can ever want the same lane.
+collect_live() {
+    local slot k start lane
+    for ((k = 0; k < LANES; k++)); do
+        LANE_LIVE[k]=-1
+    done
+    slot=$((steps / SLOT_TICKS))
+    start=$((slot - LOOKBACK))
+    ((start < 0)) && start=0
+    for ((k = start; k <= slot; k++)); do
+        sprite_alive_at "$k" "$steps" || continue
+        lane=$((k % LANES))
+        LANE_LIVE[lane]=$k
+        LIVE_VAR[lane]=$SP_VAR
+        if [[ "$SP_DIR" == "rtl" ]]; then
+            LIVE_X[lane]=$((SP_MAXX - SP_TRAVEL))
+        else
+            LIVE_X[lane]=$SP_TRAVEL
+        fi
+        LIVE_IDX[lane]=$(((steps + SP_PHASE) % ${VAR_N[SP_VAR]}))
+    done
+    return 0
+}
+
+# The single-GIF walk, unchanged in behaviour: one critter, on screen for ever,
+# wrapping to the far edge when it reaches the near one. Expressed as a one-lane
+# live set so the drawing below has only one shape to handle. The slot is the lap
+# number, so a `random` direction is re-drawn per lap rather than mid-crossing.
+classic_live() {
+    local span maxx pos lap dir flip v travel
+    maxx=$((PANEW - ${GIF_CATW[0]}))
+    ((maxx < 1)) && maxx=1
+    span=$((maxx + 1))
+    travel=$((steps * SPEED_MIN / 10))
+    pos=$((travel % span))
+    lap=$((travel / span))
+    dir="$DIRECTION"
+    if [[ "$dir" == "random" ]]; then
+        cathash "$lap"
+        (((HASH >> 15) & 1)) && dir=ltr || dir=rtl
+    fi
+    flip=0
+    [[ "$dir" != "${GIF_FACING[0]}" ]] && ((MIRROR)) && flip=1
+    v=$flip
+    LANE_LIVE[0]=$lap
+    LIVE_VAR[0]=$v
+    if [[ "$dir" == "rtl" ]]; then
+        LIVE_X[0]=$((maxx - pos))
+    else
+        LIVE_X[0]=$pos
+    fi
+    LIVE_IDX[0]=$((steps % ${VAR_N[v]}))
+    return 0
+}
+
+# draw_kitty - one payload for the whole strip. The cursor moves, the placements
+# and the deletes all go out together so nothing of tmux's own can interleave
+# and move the cursor between them, which means one repaint per tick and
+# therefore no flicker.
+draw_kitty() {
+    local i raw="" id v x
+    for ((i = 0; i < LANES; i++)); do
+        if ((${LANE_LIVE[i]} < 0)); then
+            # Lane just emptied: take its last frame off the glass.
+            if [[ -n "${LANE_PREV_ID[i]}" ]]; then
+                printf -v raw '%s\033_Ga=d,d=i,i=%d,p=%d\033\\' \
+                    "$raw" "${LANE_PREV_ID[i]}" "${LANE_PREV_PID[i]}"
+                LANE_PREV_ID[i]=""
+                LANE_PREV_PID[i]=""
+            fi
+            continue
+        fi
+        v=${LIVE_VAR[i]}
+        load_variant "$v"
+        x=${LIVE_X[i]}
+        id=$((${VAR_IDBASE[v]} + ${LIVE_IDX[i]}))
+        printf -v raw '%s\033[%d;%dH\033_Ga=p,i=%d,p=%d,C=1,q=2,Y=%d\033\\' \
+            "$raw" "$((ABS_ROW + ROW - 1))" "$((ABS_COL + x))" \
+            "$id" "${LANE_PID[i]}" "$KITTY_YPAD"
+        if [[ -n "${LANE_PREV_ID[i]}" ]]; then
+            printf -v raw '%s\033_Ga=d,d=i,i=%d,p=%d\033\\' \
+                "$raw" "${LANE_PREV_ID[i]}" "${LANE_PREV_PID[i]}"
+        fi
+        LANE_PREV_ID[i]=$id
+        LANE_PREV_PID[i]=${LANE_PID[i]}
+        LANE_PID[i]=$((${LANE_PID[i]} == 2 * i + 1 ? 2 * i + 2 : 2 * i + 1))
+    done
+    kitty_pass "$raw"
+}
+
+# draw_sixel - covers first, critters second. A cover is an opaque rectangle and
+# a later sixel placement draws over an earlier one on Konsole, so erasing every
+# lane's previous position before drawing any new one is what keeps two
+# overlapping critters from rubbing each other out. Doing it the obvious way -
+# cover then draw, per critter - would have the second one's cover punch a hole
+# in the first one.
+draw_sixel() {
+    local i out="" v x
+    for ((i = 0; i < LANES; i++)); do
+        ((${LANE_PREVX[i]} >= 0)) || continue
+        v=${LANE_PREVVAR[i]}
+        [[ -n "${COVERDATA[v]:-}" ]] || continue
+        printf -v out '%s\033[%d;%dH%s' "$out" "$ROW" \
+            "$((${LANE_PREVX[i]} + 1))" "${COVERDATA[v]}"
+    done
+    for ((i = 0; i < LANES; i++)); do
+        LANE_PREVX[i]=-1
+        ((${LANE_LIVE[i]} < 0)) && continue
+        v=${LIVE_VAR[i]}
+        load_variant "$v"
+        x=${LIVE_X[i]}
+        printf -v out '%s\033[%d;%dH%s' "$out" "$ROW" "$((x + 1))" \
+            "${SIXDATA[${VAR_OFF[v]} + ${LIVE_IDX[i]}]}"
+        LANE_PREVX[i]=$x
+        LANE_PREVVAR[i]=$v
+    done
+    printf '%s' "$out"
+}
+
 # --- walk -------------------------------------------------------------------
 # Position and animation frame are a pure function of the clock rather than
 # counters advanced once per iteration. Counters made a cat's phase depend on
@@ -657,10 +1113,8 @@ trap on_winch WINCH
 # from the edge - and they drifted besides, since each iteration costs the sleep
 # plus however much work that particular frame did. Deriving both from the time
 # means separate cats agree by construction and cannot come apart.
-idx=0
-x=0
+steps=0
 tick=0
-prev_x=-1
 last_steps=$((${EPOCHREALTIME/[.,]/} / FRAME_US))
 while :; do
     # If our tmux server is gone (kill-server) we are orphaned - bow out
@@ -683,21 +1137,20 @@ while :; do
     fi
     now=${EPOCHREALTIME/[.,]/}
     steps=$((now / FRAME_US))
-    idx=$((steps % N))
-    span=$((MAXX + 1))
-    pos=$(((steps * STEP) % span))
-    if [[ "$DIRECTION" == "rtl" ]]; then
-        x=$((MAXX - pos))
-    else
-        x=$pos
-    fi
     # A gap in the frame numbers means we were stalled - starved of time while
     # tmux was busy with a resurrect save, say - and the clock has since moved
-    # us well away from prev_x. The cover strip is one cat wide and only erases
-    # a single step, so repaint the whole strip instead of leaving the pre-stall
-    # frame stranded on the terminal with nothing sized to cover it.
+    # every critter well away from where its cover strip is. The covers are one
+    # critter wide and erase a single step, so repaint the whole strip instead of
+    # leaving pre-stall frames stranded with nothing sized to cover them.
     ((steps - last_steps > 2)) && NEED_BG=1
     last_steps=$steps
+
+    if ((SPAWN)); then
+        collect_live
+    else
+        classic_live
+    fi
+
     if [[ "$MODE" == "kitty" ]]; then
         # Out of sight: zoomed away, or in a window that is not the current
         # one. Passthrough at the `all` level reaches the terminal from both
@@ -715,7 +1168,7 @@ while :; do
                 kitty_clear
                 NEED_BG=0
             fi
-            kitty_place "$x" "$idx"
+            draw_kitty
         fi
     else
         if ((NEED_BG)); then
@@ -725,24 +1178,21 @@ while :; do
             else
                 printf '\033[2J'
             fi
-            prev_x=-1
+            for ((i = 0; i < LANES; i++)); do
+                LANE_PREVX[i]=-1
+            done
             NEED_BG=0
         fi
-        # Without a cover, a full clear is the only way to erase the old image.
-        if [[ -z "$COVERDATA" ]]; then
-            printf '\033[2J'
-        elif ((prev_x >= 0)); then
-            # cover the previous position so no stale cat remains on screen
-            printf '\033[%d;%dH%s' "$ROW" "$((prev_x + 1))" "$COVERDATA"
-        fi
-        printf '\033[%d;%dH%s' "$ROW" "$((x + 1))" "${SIXDATA[$idx]}"
-        prev_x=$x
+        # Without covers, a full clear is the only way to erase the old frames.
+        ((HAVE_COVER)) || printf '\033[2J'
+        draw_sixel
     fi
+
     # Sleep to the next frame boundary rather than for a fixed delay: that keeps
     # every cat waking on the same instants, and it is self-correcting, so a slow
     # frame is caught up instead of accumulating. A skipped frame is safe - the
-    # cover strip is drawn at prev_x, wherever the cat actually last appeared, so
-    # a jump still erases cleanly and leaves no trail.
+    # cover strips are drawn wherever the critters actually last appeared, so a
+    # jump still erases cleanly and leaves no trail.
     delay=$(((steps + 1) * FRAME_US - ${EPOCHREALTIME/[.,]/}))
     ((delay > 0)) || delay=$FRAME_US
     printf -v nap '%d.%06d' "$((delay / 1000000))" "$((delay % 1000000))"
