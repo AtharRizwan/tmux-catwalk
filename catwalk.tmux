@@ -42,10 +42,14 @@ default catwalk-gif ""
 default catwalk-bind C
 default catwalk-cache-dir "${XDG_CACHE_HOME:-$HOME/.cache}/tmux-catwalk"
 default catwalk-sixel-check 1
-# Background for the GIF's transparent pixels (sixel has no alpha). Empty =
-# auto-detect the terminal's background color (Konsole color scheme, else
-# $COLORFGBG); set a hex like #1e1e2e to override.
+# Background painted under the GIF's transparent pixels on the sixel path.
+# Empty = auto-detect the terminal's background color (Konsole color scheme,
+# else $COLORFGBG); a hex like #1e1e2e overrides it. The literal `transparent`
+# asks for a real alpha channel instead, via the Kitty graphics path.
 default catwalk-bg ""
+# Which graphics protocol to draw with: auto, sixel or kitty. auto uses kitty
+# only when @catwalk-bg is transparent and the terminal is known to support it.
+default catwalk-graphics auto
 
 # Cats appear in the initial window of a fresh session (session-created) and
 # in every subsequent new window. The after-* hooks run a catch-up scan: the
@@ -81,6 +85,14 @@ tmux set-hook -g 'after-new-window[99]' "run-shell '$SCRIPTS/catensure-all'"
 # zoom, unzoom and `choose-tree -Z` alike (verified), and catpoke nudges the cats
 # to re-check what is actually on screen.
 tmux set-hook -g 'window-layout-changed[99]' "run-shell '$SCRIPTS/catpoke'"
+
+# Switching windows changes no layout, so the hook above never fires for it. The
+# sixel path does not care - tmux draws only the current window - but a kitty
+# cat draws through passthrough, which tmux forwards from every window of the
+# session, so each cat has to know whether its own window is the one on screen.
+# Without this it would find out on its next two-second sweep, and the incoming
+# window would be catless until then.
+tmux set-hook -g 'session-window-changed[99]' "run-shell '$SCRIPTS/catpoke'"
 
 # tmux-resurrect brings panes back as plain shells - it does not re-run
 # arbitrary pane commands - so a cat that was present at save time returns as an

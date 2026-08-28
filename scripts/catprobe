@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# catprobe - one-shot diagnostic for the Kitty graphics path.
+#
+# Proves the two things the transparent render path depends on, before any of
+# catwalk is rewritten:
+#
+#   1. that an APC graphics command survives tmux's DCS passthrough, and
+#   2. that a placement lands where we aim it -- tmux's tty_cmd_rawstring only
+#      does tty_add() + tty_invalidate(), so it never moves the cursor for us
+#      and the position has to be an absolute CSI H in terminal coordinates,
+#      inside the same passthrough payload as the placement itself.
+#
+# Run it in an ordinary pane and look at the result. Nothing here is used by
+# catwalk; it is a scaffold for verifying the protocol by eye.
+#
+# Usage: scripts/catprobe [--hold SECONDS] [--frame PNG] [--id N]
+#        scripts/catprobe --walk [--steps N] [--fps N]
+#
+# --walk rehearses the animation cycle itself: place at a new column, then
+# delete the previous placement, both in one payload, with the placement id
+# alternating 1/2 so place and delete stay disjoint even when the image id
+# repeats. That is exactly what the render loop will do.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=helpers.sh
+. "$SCRIPT_DIR/helpers.sh"
+
+die() { printf 'catprobe: %s\n' "$*" >&2; exit 1; }
+
+HOLD=3
+FRAME=""
+IMG_ID=7327
+ROWS_RESERVED=5
+WALK=0
+STEPS=24
+FPS=10
+COL=3
+
+while (($#)); do
+    case "$1" in
+        --hold)  HOLD="${2:-3}"; shift 2 ;;
+        --frame) FRAME="${2:-}"; shift 2 ;;
+        --id)    IMG_ID="${2:-7327}"; shift 2 ;;
+        --col)   COL="${2:-3}"; shift 2 ;;
+        --walk)  WALK=1; shift ;;
+        --steps) STEPS="${2:-24}"; shift 2 ;;
+        --fps)   FPS="${2:-10}"; shift 2 ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+[[ -n "${TMUX:-}" ]] || die "must be run inside tmux"
+require_cmd base64 || die "base64 is required"
+
+# --- pick a frame -----------------------------------------------------------
+# Prefer a frame catwalk has already cached; they are exactly the RGBA PNGs the
+# real path would transmit. Fall back to extracting one from the GIF.
+if [[ -z "$FRAME" ]]; then
+    FRAME="$(ls -1t "$(catcache)"/*/f001.png 2>/dev/null | head -1)"
+fi
+if [[ -z "$FRAME" || ! -f "$FRAME" ]]; then
+    GIF="$(catgif)"
+    [[ -f "$GIF" ]] || die "no cached frame and no usable @catwalk-gif"
+    require_cmd ffmpeg || die "ffmpeg is required to extract a frame"
+    TMPD="$(mktemp -d)"
+    trap 'rm -rf "$TMPD"' EXIT
+    ffmpeg -y -loglevel error -i "$GIF" -frames:v 1 "$TMPD/f001.png" 2>/dev/null ||
+        die "could not extract a frame from $GIF"
+    FRAME="$TMPD/f001.png"
+fi
+
+# --- passthrough ------------------------------------------------------------
+# allow-passthrough is a pane option, so granting it here touches nothing else.
+tmux set-option -p allow-passthrough all 2>/dev/null
+
+ESC=$'\033'
+
+# pass <raw> - wrap a raw escape payload for tmux's DCS passthrough. Every ESC
+# inside the payload has to be doubled.
+pass() {
+    local raw="$1"
+    printf '%sPtmux;%s%s\\' "$ESC" "${raw//$ESC/$ESC$ESC}" "$ESC"
+}
+
+# kg <keys> [payload] - one APC graphics command
+kg() {
+    if (($# > 1)); then
+        printf '%s_G%s;%s%s\\' "$ESC" "$1" "$2" "$ESC"
+    else
+        printf '%s_G%s%s\\' "$ESC" "$1" "$ESC"
+    fi
+}
+
+# --- geometry ---------------------------------------------------------------
+# tmux's pane coordinates are window-relative and 0-indexed; CSI H wants
+# terminal-absolute and 1-indexed. When the status line sits at the top the
+# window itself starts that many rows down, which is the difference between the
+# client's height and the window's.
+read -r PANE_TOP PANE_LEFT CLIENT_H WINDOW_H CURSOR_Y < <(
+    tmux display -p -t "${TMUX_PANE:-}" \
+        '#{pane_top} #{pane_left} #{client_height} #{window_height} #{cursor_y}' 2>/dev/null)
+STATUS_POS="$(tmux show-options -gv status-position 2>/dev/null)"
+
+for v in PANE_TOP PANE_LEFT CLIENT_H WINDOW_H CURSOR_Y; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || die "tmux did not report $v"
+done
+
+OFFSET=0
+[[ "$STATUS_POS" == "top" ]] && OFFSET=$((CLIENT_H - WINDOW_H))
+((OFFSET < 0)) && OFFSET=0
+
+printf 'catprobe\n'
+printf '  frame        %s\n' "$FRAME"
+printf '  pane_top=%s pane_left=%s client_h=%s window_h=%s status=%s\n' \
+    "$PANE_TOP" "$PANE_LEFT" "$CLIENT_H" "$WINDOW_H" "${STATUS_POS:-unset}"
+printf '  status offset %s row(s)\n' "$OFFSET"
+printf '  image id      %s\n' "$IMG_ID"
+printf '\n'
+
+# Reserve room for the image, letting the pane scroll if it needs to, and only
+# then ask where the cursor ended up -- so a scroll cannot invalidate the row
+# we are about to aim at.
+for ((i = 0; i < ROWS_RESERVED; i++)); do printf '\n'; done
+CURSOR_Y="$(tmux display -p -t "${TMUX_PANE:-}" '#{cursor_y}' 2>/dev/null)"
+[[ "$CURSOR_Y" =~ ^[0-9]+$ ]] || die "tmux did not report the cursor row"
+
+TARGET_ROW=$((CURSOR_Y - ROWS_RESERVED))
+((TARGET_ROW < 0)) && TARGET_ROW=0
+ABS_ROW=$((OFFSET + PANE_TOP + TARGET_ROW + 1))
+ABS_COL=$((PANE_LEFT + COL))
+
+# --- transmit ---------------------------------------------------------------
+# Konsole rejects anything but direct transmission (t=d); f=100 falls through to
+# QPixmap::loadFromData, which sniffs PNG. q=2 suppresses the reply -- under
+# tmux a reply would come back as keystrokes.
+B64="$(base64 -w0 "$FRAME")" || die "base64 failed"
+LEN="${#B64}"
+CHUNK=4092 # multiple of 4: Konsole base64-decodes each chunk on its own
+
+nchunks=$(((LEN + CHUNK - 1) / CHUNK))
+off=0
+n=0
+while ((off < LEN)); do
+    part="${B64:off:CHUNK}"
+    off=$((off + CHUNK))
+    n=$((n + 1))
+    m=1
+    ((off >= LEN)) && m=0
+    if ((n == 1)); then
+        keys="a=t,i=${IMG_ID},f=100,t=d,q=2,m=${m}"
+    else
+        keys="a=t,m=${m},q=2"
+    fi
+    pass "$(kg "$keys" "$part")"
+done
+
+# --- place ------------------------------------------------------------------
+# The cursor move and the placement go out in ONE payload: nothing of tmux's own
+# can interleave between them, so the image cannot land somewhere else.
+# C=1 makes Konsole leave the cursor alone (moveCursor = keys['C'] == 0).
+place_at() { # place_at <abs_col> <placement_id> [prev_placement_id]
+    local raw
+    raw="$(printf '%s[%d;%dH' "$ESC" "$ABS_ROW" "$1")$(kg "a=p,i=${IMG_ID},p=$2,C=1,q=2")"
+    # Deleting the previous placement in the same payload means one repaint and
+    # no flicker. It is keyed on the placement id, not the image id, so it stays
+    # correct when consecutive frames reuse the same image.
+    if (($# > 2)); then
+        raw="${raw}$(kg "a=d,d=i,i=${IMG_ID},p=$3")"
+    fi
+    pass "$raw"
+}
+
+printf '  transmitted   %s bytes base64 in %s chunk(s)\n' "$LEN" "$nchunks"
+
+if ((WALK)); then
+    printf '  walking       %s steps at %s fps, right to left\n' "$STEPS" "$FPS"
+    printf '  placement id  alternating 1/2\n'
+    nap="$(awk -v f="$FPS" 'BEGIN{ printf "%.3f", 1/f }')"
+    pid=1
+    prev=""
+    for ((s = 0; s < STEPS; s++)); do
+        col=$((PANE_LEFT + COL + STEPS - 1 - s))
+        if [[ -n "$prev" ]]; then
+            place_at "$col" "$pid" "$prev"
+        else
+            place_at "$col" "$pid"
+        fi
+        prev="$pid"
+        pid=$((pid == 1 ? 2 : 1))
+        sleep "$nap"
+    done
+    pass "$(kg "a=d,d=i,i=${IMG_ID}")"
+    tmux refresh-client 2>/dev/null
+    printf '  walk done, placements deleted\n'
+    printf '\n'
+    printf 'Check:\n'
+    printf '  1. did the cat move smoothly right to left, staying on one row?\n'
+    printf '  2. was the background the terminal, with no slab travelling with it?\n'
+    printf '  3. did it leave NO trail, and is the strip clean now?\n'
+    exit 0
+fi
+
+place_at "$ABS_COL" 1
+
+printf '  placed at     abs row %s, col %s (pane row %s)\n' "$ABS_ROW" "$ABS_COL" "$TARGET_ROW"
+printf '  holding %ss...\n' "$HOLD"
+
+sleep "$HOLD"
+
+# --- delete -----------------------------------------------------------------
+# d=i deletes by image id; p is left off so it matches any placement id.
+pass "$(kg "a=d,d=i,i=${IMG_ID}")"
+tmux refresh-client 2>/dev/null
+
+printf '  deleted placement %s\n' "$IMG_ID"
+printf '\n'
+printf 'Check:\n'
+printf '  1. did the cat appear in the blank strip above, not somewhere else?\n'
+printf '  2. was the area around it your terminal background (no solid slab)?\n'
+printf '  3. is that strip clean now, with no ghost left behind?\n'

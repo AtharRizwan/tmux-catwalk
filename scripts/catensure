@@ -19,8 +19,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Respect the master switch
 [[ "$(catopt cats-on 1)" == "1" ]] || exit 0
 
-# Sanity gate: spawning only makes sense if the client can draw sixels.
-if [[ "$(catopt catwalk-sixel-check 1)" == "1" ]]; then
+# Sanity gate: spawning only makes sense if the client can draw the cat. The
+# check is about sixel specifically, so it applies only to the sixel path -- a
+# terminal with Kitty graphics but no sixel support draws the transparent cat
+# perfectly well, and refusing to spawn there would be wrong.
+MODE="$(catmode)"
+if [[ "$MODE" == "sixel" ]] && [[ "$(catopt catwalk-sixel-check 1)" == "1" ]]; then
     catsixel_ok || exit 0
 fi
 
@@ -56,9 +60,13 @@ HEIGHT="$(catcfg CATWALK_HEIGHT catwalk-height 3)"
 
 # Width is left to the catwalk script: it derives its own columns from the
 # height + GIF aspect (or honors @catwalk-width) so no env is forced here.
-# Pane is HEIGHT+1 rows so tmux's sixel clip (screen_size_y-1) has room and
-# the full cat image is visible.
-PANE_HEIGHT=$((HEIGHT + 1))
+# The sixel pane is HEIGHT+1 rows: tmux scrolls any sixel that reaches the last
+# row (screen_size_y-1), so the bottom row is clearance and the full cat image
+# stays visible. Nothing on the kitty path can scroll the screen -- the image
+# never passes through tmux at all -- so there the strip is exactly as tall as
+# the cat, and the row is given back to your shell.
+PANE_HEIGHT="$HEIGHT"
+[[ "$MODE" == "sixel" ]] && PANE_HEIGHT=$((HEIGHT + 1))
 # -P/-F hands back the new pane id so the @catwalk stamp lands immediately.
 # Leaving the stamp to the catwalk process itself opened a window in which a
 # second catensure pass saw no cat and split another pane in beside the first.
