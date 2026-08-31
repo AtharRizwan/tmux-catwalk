@@ -39,6 +39,13 @@ CACHE="$(catcache)"
 # cache key and which half of the draw loop runs. See catmode in helpers.sh.
 BG="$(catbg)"
 MODE="$(catmode)"
+# On the kitty path nothing is painted behind the critter - the placement
+# carries its own alpha - so BG is a mode marker rather than a colour. catmode
+# can now choose that path without @catwalk-bg having asked for it, in which
+# case catbg has already resolved to the terminal's own background; pin the
+# marker back so the cache key stays "transparent" however the path was reached,
+# and so the cover strips the sixel path needs are never built for it.
+[[ "$MODE" == "kitty" ]] && BG="transparent"
 
 # --- the pool ---------------------------------------------------------------
 # GIFSRC is what the user configured; POOL is what that expands to. A directory
@@ -389,14 +396,31 @@ kitty_pass() {
     printf '\033Ptmux;%s\033\\' "${1//$'\033'/$'\033\033'}"
 }
 
-# kitty_clear - drop every placement of ours. Deliberately not d=a, which would
-# take out every visible placement in the terminal, including other programs'.
-# Only *loaded* variants can have anything on the glass, so only their id ranges
-# are worth the escapes.
+# kitty_clear - drop every placement of the whole pool, not merely of the
+# variants this process happens to have uploaded.
+#
+# The wider sweep is what takes another session's ghosts off the glass. A cat
+# erases through a passthrough, which tmux forwards only to the clients attached
+# to its own session, so the moment a client switches *away* from a session that
+# cat can no longer erase anything - and it finds out only afterwards, with the
+# audience already gone. Its last frame is left on the terminal with nobody able
+# to take it off. Nobody, that is, except the cat in the session you switched
+# to: image ids come from the render cache key (see prepare_variant), so every
+# cat drawing the same pool at the same size addresses the same ids, and the
+# arriving cat can delete the departing one's frames as surely as its own. It
+# can only do that if it sweeps ids it never uploaded itself, hence no
+# VAR_LOADED filter here. A delete for an id the terminal never received is a
+# no-op, and the sweep runs on repaint edges rather than per tick.
+#
+# `"${!VAR_LOADED[@]}"` is the set of *prepared* variants - prepare_variant
+# initialises the entry, load_variant only flips it to 1 - which is precisely
+# the id space this configuration can put on screen.
+#
+# Deliberately not d=a, which would take out every visible placement in the
+# terminal, including other programs'.
 kitty_clear() {
     local v i raw=""
     for v in "${!VAR_LOADED[@]}"; do
-        ((${VAR_LOADED[v]})) || continue
         for ((i = 0; i < ${VAR_N[v]}; i++)); do
             printf -v raw '%s\033_Ga=d,d=i,i=%d\033\\' "$raw" "$((${VAR_IDBASE[v]} + i))"
         done
@@ -406,6 +430,39 @@ kitty_clear() {
         LANE_PREV_ID[i]=""
         LANE_PREV_PID[i]=""
     done
+}
+
+# --- who is watching --------------------------------------------------------
+# A kitty frame lives in the *terminal*, not in tmux, and it gets there through
+# a passthrough - which tmux forwards only to the clients attached to this
+# pane's session, and simply drops when there are none. load_variant uploads
+# each variant once and never again, so a cat that starts life on a detached
+# server talks to nobody and then spends the rest of its life placing images
+# the terminal has never heard of: an invisible cat, on a strip that is
+# otherwise working perfectly. Reattaching in a *different* terminal window
+# ends the same way, and only for the GIFs that had already been uploaded -
+# which is what makes it look like the pool has shrunk rather than broken.
+#
+# So keep track of who is watching. Upload again whenever the audience is not
+# the one we uploaded to, and draw nothing at all while there is none.
+CLIENT_SIG=""
+TX_SIG=""
+update_clients() {
+    local v
+    [[ "$MODE" == "kitty" ]] || return 0
+    CLIENT_SIG="$(catclientsig "${PANE_ID:-${TMUX_PANE:-}}")"
+    [[ -n "$CLIENT_SIG" ]] || return 0
+    [[ "$CLIENT_SIG" == "$TX_SIG" ]] && return 0
+    # Take our placements off the outgoing audience's glass before the incoming
+    # one is drawn to. On a terminal that never received the images - and on the
+    # outgoing one, if it is already gone - the deletes are no-ops.
+    ((${#VAR_LOADED[@]})) && kitty_clear
+    for v in "${!VAR_LOADED[@]}"; do
+        VAR_LOADED[v]=0
+    done
+    TX_SIG="$CLIENT_SIG"
+    NEED_BG=1
+    return 0
 }
 
 # discard_graphics - remove what we painted, whichever way we painted it. The
@@ -784,10 +841,20 @@ update_geom() {
     ((SLOT_TICKS < MAX_CROSS / (LANES_MAX - 2) + 1)) &&
         SLOT_TICKS=$((MAX_CROSS / (LANES_MAX - 2) + 1))
     ((SLOT_TICKS > 0)) || SLOT_TICKS=1
-    # Entrances are jittered across the whole period, so they do not land on the
-    # beat. Slot k still always starts before slot k+1 - the jitter cannot reach
-    # past the end of its own period - which keeps the lane order well defined.
-    DELAY_SPAN=$SLOT_TICKS
+    # Entrances are jittered so they do not all land on the beat - but only
+    # across a quarter of the period, not the whole of it. Jittered across the
+    # whole period, the gap between one arrival and the next runs anywhere from
+    # nothing to two full periods, so critters are born on top of each other
+    # about a tenth of the time and the strip stands empty for a stretch just as
+    # often. A pack, once formed, is permanent: every critter walks at the same
+    # speed unless @catwalk-step is given a range, so two born a second apart
+    # stay a second apart for the whole crossing. A quarter keeps the arrivals
+    # visibly off the beat while holding the gap within a quarter of a period of
+    # the average, and it is what makes @catwalk-density mean anything - at the
+    # full span even density 100 bunches. Slot k still always starts before slot
+    # k+1, which keeps the lane order well defined.
+    DELAY_SPAN=$((SLOT_TICKS / 4))
+    ((DELAY_SPAN > 0)) || DELAY_SPAN=1
     # Lane k % LANES. A critter holds its lane for at most DELAY_SPAN+MAX_CROSS
     # ticks and the lane comes round after LANES periods, so this many lanes
     # means the lane is always clear: no critter is ever turned away, and none
@@ -901,6 +968,7 @@ trap cleanup INT TERM HUP EXIT
 
 printf '\033[?25l'
 update_geom
+update_clients
 
 # A resize is the earliest notice we get that the last other pane went away:
 # this pane has to grow for that to happen. Ask the loop to re-check who is
@@ -952,8 +1020,8 @@ slot_sprite() {
     fi
     SP_SPEED=$((SPEED_MIN + (h >> 17) % (SPEED_MAX - SPEED_MIN + 1)))
     # Offset within the slot, so entrances are not all on the beat. Capped at a
-    # quarter of the period; the rest of the period is the margin that keeps a
-    # lane clear (see update_geom).
+    # quarter of the period (DELAY_SPAN, see update_geom); the rest of the
+    # period is the margin that keeps arrivals apart and a lane clear.
     SP_T0=$(($1 * SLOT_TICKS + (h >> 24) % DELAY_SPAN))
     flip=0
     [[ "$SP_DIR" != "${GIF_FACING[SP_G]}" ]] && ((MIRROR)) && flip=1
@@ -1127,12 +1195,27 @@ while :; do
         if [[ -n "$WIN_ID" && -n "$PANE_ID" ]]; then
             pane_alone_or_duplicate && break
         fi
+        # Attach, detach or a reattach from another terminal window: the
+        # frames we uploaded are no longer necessarily where our placements
+        # think they are.
+        update_clients
         # A layout change can move a pane without resizing it, so no SIGWINCH
         # arrives and update_geom never runs -- but the kitty path draws in
         # absolute terminal coordinates, which have just moved. catpoke's
         # SIGUSR1 is the notice; steady-state ticks stay fork-free.
+        #
+        # A poke also forces a full repaint, which on this path means the
+        # whole-pool sweep in kitty_clear. Every event that pokes us is one
+        # where somebody else's frames may have just been stranded on the
+        # terminal with no way to take themselves off it - a window killed
+        # outright is the clear case, since tmux unlinks the window before the
+        # cat in it can be scheduled, so its cleanup escape is addressed to a
+        # window the client's session no longer holds and is dropped. Whoever
+        # is still on screen has to do it for them, and a sweep is a couple of
+        # kilobytes on an event the user caused by hand.
         if ((poked)) && [[ "$MODE" == "kitty" ]]; then
             update_abs_origin
+            NEED_BG=1
         fi
     fi
     now=${EPOCHREALTIME/[.,]/}
@@ -1158,7 +1241,10 @@ while :; do
         # tmux simply does not draw what is not visible -- drawing here would
         # paint this cat over whatever the terminal is really showing. Sit it
         # out; becoming visible again sets NEED_BG and it comes straight back.
-        if ((ZOOM_HIDDEN || !WIN_ACTIVE)); then
+        # Out of sight, or with nobody attached to be seen by. In the second
+        # case drawing would not merely be wasted: the upload inside
+        # load_variant would be dropped and the variant marked sent for good.
+        if ((ZOOM_HIDDEN || !WIN_ACTIVE)) || [[ -z "$CLIENT_SIG" ]]; then
             NEED_BG=1
         else
             # No background to lay down and nothing to cover: the placement

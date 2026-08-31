@@ -225,13 +225,51 @@ catgraphics() {
 # itself rather than forwarding them to the pane, so probing would hang or
 # leak the answer into somebody's shell as keystrokes. Recognise the terminals
 # known to implement it instead, and let @catwalk-graphics kitty force it.
+#
+# Every obvious clue is destroyed by tmux itself, which is why this digs around
+# for them. Inside a pane $TERM has become tmux-256color and $TERM_PROGRAM the
+# literal string "tmux" (verified), so a WezTerm, a Ghostty or a kitty looks
+# from in here exactly like a terminal that can do nothing at all - and since
+# transparency is now what `auto` reaches for, a missed detection is a cat
+# rendered the opaque way on a terminal that could have done better. Konsole is
+# the one that gets through unaided, because it exports a variable of its own
+# that tmux passes along. For the rest, the client's real terminal type and the
+# environment the server was started in still know the answer.
 catkitty_ok() {
-    # Konsole exports this into every pane, so it survives into tmux where
-    # $TERM has become tmux-256color and tells us nothing.
+    local v
+
+    # Konsole exports this into every pane; also check the server environment,
+    # for a cat whose own env predates the terminal it ended up on.
+    #
+    # The exit status of show-environment cannot be used for this. It is 1 only
+    # for a name the environment has never heard of; a name someone *removed*
+    # (`set-environment -gr`) is reported as the string "-NAME" and exits 0, so
+    # testing the status alone would read a variable explicitly unset as proof
+    # of a Konsole. Match the assignment itself.
     [[ -n "${KONSOLE_VERSION:-}" ]] && return 0
-    case "${TERM_PROGRAM:-}" in
+    v="$(tmux show-environment -g KONSOLE_VERSION 2>/dev/null)"
+    [[ "$v" == KONSOLE_VERSION=?* ]] && return 0
+
+    # $TERM_PROGRAM is "tmux" in here, so it has to be read back from the
+    # global environment, where the pre-tmux value survives.
+    v="${TERM_PROGRAM:-}"
+    [[ "$v" == "tmux" ]] && v=""
+    if [[ -z "$v" ]]; then
+        v="$(tmux show-environment -g TERM_PROGRAM 2>/dev/null)"
+        [[ "$v" == TERM_PROGRAM=?* ]] && v="${v#TERM_PROGRAM=}" || v=""
+    fi
+    case "$v" in
         WezTerm | ghostty | kitty) return 0 ;;
     esac
+
+    # The attached client's own terminal type, which tmux does keep verbatim -
+    # this is what catches kitty and Ghostty from inside a pane.
+    while read -r v; do
+        case "$v" in
+            xterm-kitty | xterm-ghostty) return 0 ;;
+        esac
+    done < <(tmux list-clients -F '#{client_termname}' 2>/dev/null)
+
     case "${TERM:-}" in
         xterm-kitty | xterm-ghostty) return 0 ;;
     esac
@@ -240,20 +278,34 @@ catkitty_ok() {
 
 # catmode - the resolved render mode: "kitty" or "sixel".
 #
-# Transparency is opt-in and falls back rather than failing: it needs both
-# @catwalk-bg transparent and a terminal that can do it, and if either is
-# missing the opaque sixel path is used exactly as before. Emitting Kitty
-# escapes at a terminal that does not understand them would print the base64
-# payload as garbage, which is much worse than an opaque cat.
+# Transparency is what `auto` reaches for: any terminal known to implement the
+# Kitty protocol gets the transparent path, without @catwalk-bg having to ask
+# for it. It is simply the better rendering - a real alpha channel, including on
+# the anti-aliased edges sixel cannot represent at all - so having it wait to be
+# opted into meant most people never saw it.
+#
+# It still falls back rather than failing. Emitting Kitty escapes at a terminal
+# that does not understand them prints the base64 payload as garbage, which is
+# much worse than an opaque cat, so an unrecognised terminal keeps sixel.
+#
+# Naming an actual colour in @catwalk-bg still means what it says - a background
+# painted under the critter, which only the sixel path can do - so that is left
+# on sixel too. The two explicit settings win outright: `@catwalk-graphics
+# sixel` never takes this path, and `kitty` always does (and its background is
+# transparent by definition, so a colour set alongside it is ignored).
 catmode() {
-    local g
+    local g bg
     g="$(catgraphics)"
     [[ "$g" == "sixel" ]] && { printf 'sixel'; return; }
-    if [[ "$(catbg)" == "transparent" ]]; then
-        if [[ "$g" == "kitty" ]] || catkitty_ok; then
-            printf 'kitty'
-            return
-        fi
+    [[ "$g" == "kitty" ]] && { printf 'kitty'; return; }
+    # auto. Deliberately the raw option rather than catbg's resolved colour: an
+    # unset @catwalk-bg means "whatever suits this terminal", which is
+    # transparency wherever it can be had, while catbg would have already turned
+    # that into the terminal's own background colour and lost the difference.
+    bg="$(catcfg CATWALK_BG catwalk-bg '')"
+    if [[ -z "$bg" || "$bg" == "transparent" ]] && catkitty_ok; then
+        printf 'kitty'
+        return
     fi
     printf 'sixel'
 }
@@ -303,4 +355,50 @@ catresurrect_dir() {
     fi
     d="${d//\$HOME/$HOME}"
     printf '%s' "${d/#\~/$HOME}"
+}
+
+# catrestore_running - true while tmux-resurrect is actively rebuilding the
+# server.
+catrestore_running() {
+    pgrep -f '[t]mux-resurrect/scripts/restore\.sh' >/dev/null 2>&1
+}
+
+# catrestore_pending - true while tmux-continuum's boot-time auto-restore is
+# still to *come*. It arms the restore whenever it loads into a server younger
+# than @continuum-restore-max-delay and then sleeps a second before handing over
+# to resurrect, so for that whole window the server can be repopulated at any
+# moment even though catrestore_running is still false.
+#
+# Spawning a cat inside that window is not merely untidy, it corrupts the
+# restore: resurrect treats the server as "restoring from scratch" only when it
+# holds exactly one pane, and from scratch is the mode that overwrites the
+# shell the user's own `tmux new -As foo` just created. A cat beside that shell
+# makes two panes, resurrect switches to merge mode, one saved pane is never
+# recreated, and the pane count no longer matches the saved layout string --
+# select-layout then fails silently and the window is left as the flat stack of
+# full-width panes the sequential splits produced.
+catrestore_pending() {
+    local start max
+    [[ "$(catopt continuum-restore off)" == "on" ]] || return 1
+    [[ -f "$HOME/tmux_no_auto_restore" ]] && return 1
+    start="$(tmux display-message -p -F '#{start_time}' 2>/dev/null)"
+    [[ "$start" =~ ^[0-9]+$ ]] || return 1
+    max="$(catopt continuum-restore-max-delay 10)"
+    [[ "$max" =~ ^[0-9]+$ ]] || max=10
+    # The grace is continuum's own one-second sleep plus room for a slow boot.
+    (( $(date +%s) - start < max + 5 ))
+}
+
+# catclientsig <pane-target> - a token for the clients attached to that pane's
+# session, empty when nobody is attached.
+#
+# It matters on the kitty path because a passthrough only reaches a terminal
+# through an attached client: tty_cmd_rawstring writes to the clients tmux
+# finds for the pane's session, and with none there the escape is simply
+# dropped. So this is exactly the set of terminals a transmission can land in,
+# and a change to it means the frames a cat uploaded are no longer where its
+# placements think they are.
+catclientsig() {
+    [[ -n "${1:-}" ]] || return 0
+    tmux list-clients -t "$1" -F '#{client_pid}' 2>/dev/null | LC_ALL=C sort | tr '\n' ','
 }

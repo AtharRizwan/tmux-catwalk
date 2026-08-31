@@ -7,6 +7,8 @@ set -uo pipefail
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$CURRENT_DIR/scripts"
+# shellcheck source=scripts/helpers.sh
+. "$SCRIPTS/helpers.sh"
 
 # default <name-without-@> <value> - set only if unset
 default() {
@@ -36,10 +38,18 @@ default catwalk-cell-ratio auto
 default catwalk-cell-px auto
 default catwalk-top-pad 1
 default catwalk-fps 10
-default catwalk-step 1
-# ltr, rtl, or random. random draws a direction per critter and mirrors the
-# artwork of the ones walking against the way they were drawn.
-default catwalk-direction rtl
+# A range rather than one number, so the pool walks at a spread of gaits instead
+# of in lockstep. The old default of a flat `1` was ten columns a second, which
+# crosses a wide pane in under twenty seconds and reads as hurrying rather than
+# strolling; every critter is slower than that now, and no two quite alike.
+default catwalk-step 0.4-0.8
+# ltr, rtl, or random. random, the default, draws a direction per critter and
+# mirrors the artwork of the ones walking against the way they were drawn - a
+# strip where everyone files past the same way reads as a conveyor belt rather
+# than as animals. `ltr` or `rtl` pins one direction for the whole pool, which
+# also halves the render: only the one flip of each GIF can ever occur, so only
+# that one is built.
+default catwalk-direction random
 # A single GIF walks end to end for ever, exactly as it always has. A directory
 # turns on the spawner: critters appear at random, one at a time or three at
 # once, each with its own GIF, speed and direction.
@@ -51,7 +61,7 @@ default catwalk-mirror 1
 # Spawner shape: how many critters to keep walking at once, how often one is
 # born (auto = as often as @catwalk-max-cats needs), how bunched up the arrivals
 # are, and a cap on how many GIFs to take out of a large directory.
-default catwalk-max-cats 3
+default catwalk-max-cats 2
 default catwalk-spawn auto
 default catwalk-density 70
 default catwalk-max-gifs 0
@@ -59,12 +69,16 @@ default catwalk-bind C
 default catwalk-cache-dir "${XDG_CACHE_HOME:-$HOME/.cache}/tmux-catwalk"
 default catwalk-sixel-check 1
 # Background painted under the GIF's transparent pixels on the sixel path.
-# Empty = auto-detect the terminal's background color (Konsole color scheme,
-# else $COLORFGBG); a hex like #1e1e2e overrides it. The literal `transparent`
-# asks for a real alpha channel instead, via the Kitty graphics path.
+# Empty, the default, means "whatever suits this terminal": a real alpha channel
+# where the terminal can do it, and otherwise the terminal's own background
+# colour auto-detected (Konsole color scheme, else $COLORFGBG) and painted in.
+# A hex like #1e1e2e pins an opaque colour and keeps the sixel path; the literal
+# `transparent` asks for the alpha channel outright.
 default catwalk-bg ""
-# Which graphics protocol to draw with: auto, sixel or kitty. auto uses kitty
-# only when @catwalk-bg is transparent and the terminal is known to support it.
+# Which graphics protocol to draw with: auto, sixel or kitty. auto takes the
+# kitty path on any terminal known to implement it - that is where transparency
+# comes from, and it no longer has to be opted into with @catwalk-bg - and falls
+# back to sixel on terminals that would print the escapes as garbage.
 default catwalk-graphics auto
 
 # Cats appear in the initial window of a fresh session (session-created) and
@@ -110,6 +124,23 @@ tmux set-hook -g 'window-layout-changed[99]' "run-shell '$SCRIPTS/catpoke'"
 # window would be catless until then.
 tmux set-hook -g 'session-window-changed[99]' "run-shell '$SCRIPTS/catpoke'"
 
+# Switching *sessions* is the same problem one level up, and worse: a cat can
+# only erase through a client attached to its own session, so the session being
+# left keeps no way to take its last frame off the terminal - the arriving
+# session's cat has to sweep it up (see kitty_clear). Without this hook that
+# happens on the next two-second sweep, which is two seconds of the previous
+# session's cats sitting on top of the one you just switched to.
+tmux set-hook -g 'client-session-changed[99]' "run-shell '$SCRIPTS/catpoke'"
+
+# A kitty cat uploads its frames to the terminal once, through passthrough, and
+# passthrough reaches a terminal only while a client is attached to the session.
+# Attaching, detaching, or reattaching from another terminal window therefore
+# changes - or removes - the only place those frames exist, and the cats have to
+# upload again. catpoke is the same nudge the zoom hook uses; the cats work out
+# for themselves whether the audience actually changed.
+tmux set-hook -g 'client-attached[99]' "run-shell '$SCRIPTS/catpoke'"
+tmux set-hook -g 'client-detached[99]' "run-shell '$SCRIPTS/catpoke'"
+
 # tmux-resurrect brings panes back as plain shells - it does not re-run
 # arbitrary pane commands - so a cat that was present at save time returns as an
 # empty strip, and the catch-up pass would add a real cat beside it: one more
@@ -139,6 +170,20 @@ if [[ -n "$BIND" ]]; then
 fi
 
 # Catch-up on a running server (reload / tpm install / prefix + I).
+#
+# At boot this runs *before* tmux-continuum's restore, which arms itself here
+# and only then sleeps a second, so the pgrep-for-restore.sh guard inside
+# catensure-all sees nothing and would happily spawn. It must not: the cat lands
+# beside the shell the user's own `tmux new -As foo` just made, resurrect counts
+# two panes instead of one, stops treating the server as empty, and merges the
+# saved windows into the existing one - a pane short, and with a pane count the
+# saved layout string no longer matches, so select-layout fails and the window
+# is left as a flat stack of full-width panes. catrestore_pending in helpers.sh
+# is the check; catlater does the pass once the restore is over.
 if tmux list-sessions >/dev/null 2>&1; then
-    tmux run-shell "$SCRIPTS/catensure-all" 2>/dev/null
+    if catrestore_running || catrestore_pending; then
+        tmux run-shell -b "$SCRIPTS/catlater" 2>/dev/null
+    else
+        tmux run-shell "$SCRIPTS/catensure-all" 2>/dev/null
+    fi
 fi

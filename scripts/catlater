@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# catlater - run the catch-up pass once tmux-resurrect is out of the way.
+#
+# catwalk.tmux backgrounds this instead of calling catensure-all directly when
+# it loads into a server that tmux-continuum is about to repopulate. Spawning a
+# cat before that restore corrupts it; catrestore_pending in helpers.sh spells
+# out how.
+#
+# Waits for the restore to show up and finish, then does the --restored pass.
+# The resurrect post-restore-all hook normally gets there first, and this pass
+# is idempotent, so the overlap costs nothing. If no restore ever materialises -
+# @continuum-restore is on but there is nothing saved, or another tmux server
+# made continuum stand down - the pass still runs once the window has elapsed,
+# so the cats turn up either way.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=helpers.sh
+. "$SCRIPT_DIR/helpers.sh"
+
+# Wait for the restore to start, but only for as long as it could still be
+# coming: once catrestore_pending goes false nothing is going to arm one.
+while ! catrestore_running; do
+    catrestore_pending || break
+    sleep 0.25
+done
+
+# ... and then for it to finish. No deadline here: a long restore is exactly
+# the case this exists for, and the loop ends when the process does.
+while catrestore_running; do
+    sleep 0.25
+done
+
+exec "$SCRIPT_DIR/catensure-all" --restored

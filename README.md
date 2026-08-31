@@ -10,19 +10,20 @@ whole menagerie: critters wander in at random, one at a time or three at once,
 each with its own GIF, its own speed and its own direction, with quiet gaps in
 between. See [A directory of critters](#a-directory-of-critters).
 
-Set `@catwalk-bg transparent` and the cat is drawn with the
+On any terminal that speaks the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
-instead, which has a real alpha channel - so the GIF's transparent pixels are
-genuinely transparent rather than filled with a background colour. See
-[Transparency](#transparency).
+(Konsole, kitty, Ghostty, WezTerm) the cat is drawn with it automatically, which
+gives a real alpha channel - so the GIF's transparent pixels are genuinely
+transparent rather than filled with a background colour. Nothing to set; other
+terminals fall back to sixel. See [Transparency](#transparency).
 
 ## Requirements
 
 - tmux >= 3.2
 - `ffmpeg` and `ffprobe` (GIF frame extraction and aspect detection)
 - `python3` (frame post-processing)
-- a sixel-capable terminal, **or** one that speaks the Kitty graphics protocol
-  (Konsole, kitty, Ghostty, WezTerm) if you want `@catwalk-bg transparent`
+- a terminal that speaks the Kitty graphics protocol (Konsole, kitty, Ghostty,
+  WezTerm), **or** a sixel-capable one
 - `chafa` - sixel path only; the transparent path transmits the frames as PNG
   and never invokes it
 
@@ -67,17 +68,17 @@ set -g @catwalk-step "0.5-1"                   # a range, so they amble at diffe
 | `@catwalk-cell-px`     | _(auto)_                                   | override the cell size in pixels (`WxH`) the frames are rendered to                 |
 | `@catwalk-top-pad`     | `1`                                        | 6px bands of headroom above the cat's head (shifts the cat down); `0` disables      |
 | `@catwalk-fps`         | `10`                                       | animation frames per second                                                         |
-| `@catwalk-step`        | `1`                                        | cells advanced per tick, decimals allowed (`0.5`); `MIN-MAX` (e.g. `0.5-1`) gives the spawner a range to draw each critter's speed from |
-| `@catwalk-direction`   | `rtl`                                      | `rtl` (right to left), `ltr`, or `random` for a direction per critter               |
+| `@catwalk-step`        | `0.4-0.8`                                  | cells advanced per tick, decimals allowed (`0.5`); `MIN-MAX` (e.g. `0.5-1`) gives the spawner a range to draw each critter's speed from |
+| `@catwalk-direction`   | `random`                                   | a direction per critter; `rtl` (right to left) or `ltr` pins one for the whole pool  |
 | `@catwalk-gif`         | **(required)**                             | a walking-cat GIF, or a directory of them (see [A directory of critters](#a-directory-of-critters)) |
 | `@catwalk-facing`      | `rtl`                                      | which way the artwork itself walks, so the spawner knows who to mirror; a file named `fox.ltr.gif` overrides it |
 | `@catwalk-mirror`      | `1`                                        | flip the frames of a critter walking against its artwork; `0` to never mirror       |
-| `@catwalk-max-cats`    | `3`                                        | roughly the busiest the strip gets; sets how often critters are born (directory mode) |
+| `@catwalk-max-cats`    | `2`                                        | roughly the busiest the strip gets; sets how often critters are born (directory mode) |
 | `@catwalk-spawn`       | _(auto)_                                   | seconds between spawn chances; unset lets `@catwalk-max-cats` decide, a number pins it and overrides |
 | `@catwalk-density`     | `70`                                       | percentage of spawn chances that actually produce a critter - how bunched up the arrivals are, not how many |
 | `@catwalk-max-gifs`    | `0`                                        | cap on how many GIFs to take from a large directory (`0` = all)                     |
 | `@catwalk-bind`        | `C`                                        | prefix key to toggle cats                                                           |
-| `@catwalk-bg`          | _(auto)_                                   | background for the GIF's transparent pixels; empty = detect terminal bg, hex overrides, `transparent` = real alpha |
+| `@catwalk-bg`          | _(auto)_                                   | background for the GIF's transparent pixels; empty = real alpha where the terminal allows it, else detect terminal bg; a hex pins an opaque colour, `transparent` asks for alpha outright |
 | `@catwalk-graphics`    | `auto`                                     | `auto`, `sixel` or `kitty` - which graphics protocol to draw with                   |
 | `@catwalk-cache-dir`   | `${XDG_CACHE_HOME:-~/.cache}/tmux-catwalk` | render cache                                                                        |
 | `@catwalk-sixel-check` | `1`                                        | refuse to spawn unless the attached client reports the `sixel` terminal feature (sixel path only) |
@@ -121,9 +122,20 @@ and it is also what looks most like wildlife.
 Turn `@catwalk-max-cats` down for a quieter strip and up for a busier one; it
 scales about linearly. `@catwalk-density` does *not* change how many there are -
 it cancels out - it changes how bunched up the arrivals are: low values mean
-fewer, more clustered spawn chances and longer quiet stretches. Set
-`@catwalk-spawn` to a number only if you want to pin the interval yourself, in
-which case `@catwalk-max-cats` stops deciding anything.
+fewer, more clustered spawn chances and longer quiet stretches. Set it to `100`
+for arrivals that are evenly spaced instead. Set `@catwalk-spawn` to a number
+only if you want to pin the interval yourself, in which case
+`@catwalk-max-cats` stops deciding anything.
+
+Arrivals are nudged off the beat by a jitter of a quarter of the spawn period,
+not the whole of it. That matters more than it sounds: jittered across a whole
+period, the gap between one arrival and the next runs from nothing to two full
+periods, so critters are born on top of each other about a tenth of the time.
+And a pack, once formed, is permanent - everything walks at the same speed
+unless `@catwalk-step` is given a range, so two critters born a second apart
+stay a second apart for the whole crossing. If you want them further apart
+still, give `@catwalk-step` a range like `0.7-1.3`: differing speeds are what
+lets a pair that did arrive together drift apart on the way across.
 
 None of that randomness is actually rolled. Every property of a critter is a
 bit-field of a hash of the *spawn slot number*, so the whole menagerie stays a
@@ -134,17 +146,18 @@ starting over.
 
 ### How fast they walk
 
-`@catwalk-step` is cells per tick, and `@catwalk-fps` is ticks per second, so the
-default `1` at `10` fps is ten columns a second - brisk. Decimals are allowed, and
-a `MIN-MAX` range is what gives a pool its variety of gaits. What matters is how
-long a crossing takes, which depends on how wide your pane is; on a 170-column
-one:
+`@catwalk-step` is cells per tick, and `@catwalk-fps` is ticks per second, so a
+flat `1` at `10` fps is ten columns a second - brisk enough to read as hurrying.
+The default is the range `0.4-0.8` instead: decimals are allowed, and a `MIN-MAX`
+range is what gives a pool its variety of gaits. What matters is how long a
+crossing takes, which depends on how wide your pane is; on a 170-column one:
 
 | `@catwalk-step` | time to cross |
 | --------------- | ------------- |
 | `2`             | 8s            |
 | `1`             | 16s           |
 | `0.5-1`         | 16-33s        |
+| `0.4-0.8`       | 20-41s _(default)_ |
 | `0.3-0.8`       | 20-54s        |
 | `0.2-0.5`       | 33-82s        |
 
@@ -248,22 +261,31 @@ failing that from `$COLORFGBG`. Set `@catwalk-bg` to a hex colour (e.g.
 `#1e1e2e`) to force one.
 
 On a semi-transparent or blurred terminal that still looks wrong, because a
-solid rectangle cannot follow the blur. For that, ask for real transparency:
+solid rectangle cannot follow the blur.
 
-```tmux
-set -g @catwalk-bg transparent
-```
+So that painted rectangle is the fallback, not the default. Where the terminal
+speaks the **Kitty graphics protocol** the cat is drawn with it instead, which
+has an actual alpha channel: Konsole keeps each frame as a pixmap and
+alpha-blends it over whatever is behind, so the GIF's transparent pixels show
+your terminal background - blur, translucency and all - and its anti-aliased
+edges blend properly instead of being forced to one colour or none. This needs
+no configuration; it is simply the better rendering, and having it wait to be
+asked for meant most people never saw it.
 
-That switches the cat to the **Kitty graphics protocol**, which has an actual
-alpha channel. Konsole keeps each frame as a pixmap and alpha-blends it over
-whatever is behind, so the GIF's transparent pixels show your terminal
-background - blur, translucency and all - and its anti-aliased edges blend
-properly instead of being forced to one colour or none.
+It falls back rather than failing. Emitting Kitty escapes at a terminal that
+does not understand them would print the base64 payload as garbage, which is far
+worse than an opaque cat, so an unrecognised terminal keeps sixel. The terminal
+has to be recognised by name - there is no way to ask it, since a query response
+goes back to tmux rather than to the pane - and tmux itself destroys the obvious
+clues, rewriting `$TERM` to `tmux-256color` and `$TERM_PROGRAM` to the literal
+`tmux` inside every pane. The client's own terminal type and the environment the
+server was started in are what actually get consulted.
 
-It is opt-in and falls back rather than failing: if the terminal is not one
-known to support Kitty graphics, the opaque sixel path is used exactly as
-before. `@catwalk-graphics` forces the choice either way (`kitty` to use it on a
-terminal not on the list, `sixel` to keep the old path regardless).
+Both settings still override it. A hex colour in `@catwalk-bg` means what it
+says - a background painted under the critter, which only sixel can do - so that
+keeps the opaque path; `transparent` asks for alpha outright. `@catwalk-graphics`
+forces the protocol either way (`kitty` to use it on a terminal not on the list,
+`sixel` to keep the opaque path regardless).
 
 Three things get better on the transparent path, all for the same reason - a
 placement can be *deleted*, where a sixel can only be painted over:
@@ -314,15 +336,23 @@ below it.
   moves the cursor for passthrough output, the cat computes its own
   terminal-absolute origin from `pane_top`/`pane_left` and the status-bar
   position, and recomputes it whenever the layout changes.
+- Those uploaded frames live in the *terminal*, not in tmux, and a passthrough
+  only reaches a terminal that has a client attached - with none, tmux drops it.
+  So a cat also tracks which clients are attached to its session: it draws
+  nothing while there are none, and re-uploads whenever that set changes.
+  Without it, a cat that started on a detached server (or one whose session was
+  reattached from a second terminal window) would go on placing images the
+  terminal had never been given, and simply not appear.
 - Position and frame index are computed from `$EPOCHREALTIME` divided by the
   frame period, and each frame sleeps to the *next* frame boundary rather than
   for a fixed delay. That is what keeps separate cats identical, and it is
   self-correcting: a slow frame is caught up instead of accumulating drift.
-- `catpoke` runs on the `window-layout-changed` and `session-window-changed`
-  hooks and sends each cat a `SIGUSR1`. Zoom hides the other panes without
-  resizing them, so no `SIGWINCH` arrives, and a window switch changes no
-  geometry at all; the signal is what lets a cat react to being hidden
-  immediately rather than on its next periodic check.
+- `catpoke` runs on the `window-layout-changed`, `session-window-changed`,
+  `client-session-changed`, `client-attached` and `client-detached` hooks and
+  sends each cat a `SIGUSR1`. Zoom hides the other panes without resizing them,
+  so no `SIGWINCH` arrives, and a window or session switch changes no geometry
+  at all; the signal is what lets a cat react to being hidden immediately rather
+  than on its next periodic check.
 - Only the cat in the window you are looking at draws, and on the transparent
   path that is the cat's own job rather than tmux's. Passthrough at the `all`
   level is forwarded from every window of the session - tmux checks only that
@@ -330,6 +360,24 @@ below it.
   - so each cat tracks whether its window is on screen and takes its placements
   down when it is not. Otherwise every window's cat would draw over the one
   window actually being displayed.
+- Switching *sessions* is the same problem, and a cat cannot solve its own half
+  of it. Erasing goes out as a passthrough too, which reaches only the clients
+  attached to the cat's own session - so by the time a cat notices the client
+  has switched away, it has already lost the only route to the terminal it
+  drew on, and its last frame is stranded there. The cat in the session you
+  switched *to* is what clears it: image ids are derived from the render cache
+  key, so every cat drawing the same pool at the same size addresses the same
+  ids, and its repaint sweeps the whole pool's id range rather than only the
+  frames it uploaded itself. The same sweep is what lets the last cat to exit
+  take the ghosts of detached sessions down with it.
+- `catkill` (the toggle, and anything else that clears the cats) signals each
+  cat and waits for it to leave before it resorts to `kill-pane`. A cat erases
+  itself from its exit trap, and on the transparent path that erase is a
+  passthrough, which tmux delivers only while the pane's window is still in the
+  session: `kill-pane` removes the window first and signals the process second,
+  so the escape would be addressed to a window that has already gone. A
+  `SIGTERM` leaves the pane standing for the moment the write takes, and the
+  pane closes on its own when the process exits.
 - `catsave` runs on resurrect's `post-save-layout` hook and records each cat's
   `session:window.pane` beside the state file; `catensure-all --restored` uses
   that record to `respawn-pane` those exact panes back into cats, re-checking
@@ -365,6 +413,11 @@ exactly the case a zoomed-away cat needs to clear itself out of.
   `tmux list-clients -F '#{client_termfeatures}'` must include `sixel`. That
   check is a sixel-path one; on the transparent path it is skipped, since tmux
   has no feature flag for Kitty graphics.
+- **Nothing appears on the transparent path, or only some of the critters do**:
+  the frames are uploaded to the terminal once, and only a terminal attached at
+  that moment receives them. Cats now wait for a client and re-upload when the
+  set of attached clients changes, so this should not happen; if you are running
+  an older copy, reattaching or `prefix + C` twice forces the upload again.
 - **They walk too fast or too slowly**: `@catwalk-step`, which takes decimals -
   `0.5-1` is a comfortable amble on a wide pane, `0.2-0.5` a crawl. See
   [How fast they walk](#how-fast-they-walk). Do not reach for `@catwalk-fps`:
@@ -375,11 +428,15 @@ exactly the case a zoomed-away cat needs to clear itself out of.
   not how many there are.
 - **The first launch sits there empty**: every GIF in the directory is being
   rendered. It is cached; only the first run pays for it.
-- **Ghost pixels after toggle**: this is Konsole bug 456354, and it is
-  specific to the sixel path. The exit trap clears the sixel layer
-  automatically; if it persists, try `prefix + C` twice. On the transparent
-  path the cat deletes its own placements by id, so there is nothing to leave
-  behind.
+- **Ghost pixels after toggle**: on the sixel path this is Konsole bug 456354;
+  the exit trap clears the sixel layer automatically, and if it persists, try
+  `prefix + C` twice. The transparent path used to have a ghost of its own, for
+  a different reason: a cat erases itself with a passthrough, and tmux forwards
+  one only while the client's session still holds the pane's window, so a cat
+  whose pane was killed out from under it was writing its cleanup to a window
+  that no longer existed. Killing the panes is now asked-then-forced, and any
+  cat still on screen sweeps the whole pool on every poke, so frames stranded
+  by a window killed outright are taken down by whoever is still watching.
 - **The screen blinks when cats disappear**: expected on the sixel path.
   Discarding the sixel layer means cycling the alternate screen, and tmux
   repaints afterwards. It happens when cats are toggled off and when one is

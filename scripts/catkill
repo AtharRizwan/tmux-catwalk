@@ -4,7 +4,9 @@
 # brings panes back as plain shells, so a saved cat would return as an empty
 # strip and catensure would add a second, real one beside it).
 #
-# Each pane's own exit trap discards the terminal's sixel graphics layer.
+# Each pane's own exit trap discards the terminal's graphics layer - but only if
+# it is given the chance to, which is why the cats are asked to leave before
+# they are killed.
 
 set -uo pipefail
 
@@ -12,6 +14,36 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=helpers.sh
 . "$SCRIPT_DIR/helpers.sh"
 
+# Ask first, kill second.
+#
+# On the transparent path a cat erases itself with a tmux passthrough, and tmux
+# forwards one only to clients whose session still holds the pane's window
+# (screen_write_set_client_cb). kill-pane takes the pane away first and signals
+# the process second, so the cleanup escape is addressed to a window that is
+# already gone and is dropped on the floor - the cat's last frame stays on the
+# terminal with nothing left running that could take it off. A SIGTERM leaves
+# the pane standing for the moment it takes to write that escape, and the pane
+# then closes on its own when the process exits.
+#
+# Only signal a pid that really is one of ours: pids are reused, and the pane
+# option outlives nothing.
+while IFS=' ' read -r pane pid; do
+    [[ -n "$pane" ]] || continue
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    grep -qa catwalk "/proc/$pid/cmdline" 2>/dev/null || continue
+    kill -TERM "$pid" 2>/dev/null || true
+done < <(tmux list-panes -a -f '#{@catwalk}' \
+    -F '#{pane_id} #{@catwalk-pid}' 2>/dev/null)
+
+# Half a second is many times what a cat needs to erase and exit, and the wait
+# ends the moment the last pane is gone, so the common case costs one poll.
+for _ in $(seq 10); do
+    [[ -n "$(catpanes)" ]] || break
+    sleep 0.05
+done
+
+# Whatever did not take the hint still has to go: a wedged cat, or a strip that
+# resurrect brought back as a plain shell with no process of ours behind it.
 while read -r pane; do
     [[ -n "$pane" ]] || continue
     tmux kill-pane -t "$pane" 2>/dev/null || true

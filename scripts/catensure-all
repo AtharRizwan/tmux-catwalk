@@ -3,10 +3,12 @@
 # pass used by the hooks, after plugin load on a running server, and after a
 # resurrect restore.
 #
-# While a resurrect restore is in progress, windows are still being populated
-# from the saved layout. Spawning then would race the restore, so we defer; the
-# resurrect post-restore-all hook re-runs this with --restored once the restore
-# has finished.
+# While a resurrect restore is in progress -- or, at boot, still queued behind
+# tmux-continuum's one-second sleep -- windows are about to be populated from
+# the saved layout, and an extra pane is enough to derail that (see
+# catrestore_pending in helpers.sh). So we defer; the resurrect
+# post-restore-all hook re-runs this with --restored once the restore has
+# finished, and catlater covers the case where the restore never comes.
 
 set -uo pipefail
 
@@ -20,8 +22,8 @@ RESTORED=0
 if [[ "${1:-}" == "--restored" ]]; then
     RESTORED=1
 else
-    # defer while tmux-resurrect is actively restoring
-    if pgrep -f '[t]mux-resurrect/scripts/restore\.sh' >/dev/null 2>&1; then
+    # defer while a resurrect restore is running or still on its way
+    if catrestore_running || catrestore_pending; then
         exit 0
     fi
 fi
