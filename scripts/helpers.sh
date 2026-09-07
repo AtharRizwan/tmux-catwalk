@@ -188,7 +188,31 @@ catbg_auto() {
         fi
     fi
 
+    catbg_iterm2 && return 0
     catbg_colorfgbg
+}
+
+# catbg_iterm2 - the iTerm2 half of the same idea as the Konsole block above:
+# ask the terminal's own configuration what its background is. Worth a branch of
+# its own because COLORFGBG would otherwise answer for it, and its ANSI index is
+# 0 - pure black - for every dark theme, which is a slab you can see. Needs the
+# profile name iTerm2 exports and the system appearance, which only the shell
+# can read; both are passed in.
+catbg_iterm2() {
+    local v
+    [[ "${LC_TERMINAL:-}" == "iTerm2" ]] || {
+        v="$(tmux show-environment -g TERM_PROGRAM 2>/dev/null)"
+        [[ "$v" == "TERM_PROGRAM=iTerm.app" ]] || return 1
+    }
+    require_cmd python3 || return 1
+    if [[ -z "${ITERM_PROFILE:-}" ]]; then
+        v="$(tmux show-environment -g ITERM_PROFILE 2>/dev/null)"
+        [[ "$v" == ITERM_PROFILE=?* ]] && export ITERM_PROFILE="${v#ITERM_PROFILE=}"
+    fi
+    export CATWALK_APPEARANCE="$(defaults read -g AppleInterfaceStyle 2>/dev/null)"
+    v="$(python3 "$CATWALK_SCRIPT_DIR/catiterm.py" 2>/dev/null)"
+    [[ "$v" =~ ^#[0-9a-fA-F]{6}$ ]] || return 1
+    printf '%s' "$v"
 }
 
 # catbg_colorfgbg - terminals that are not Konsole (xterm, foot, WezTerm, ...)

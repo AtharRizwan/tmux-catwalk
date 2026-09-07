@@ -256,9 +256,14 @@ being precise about because the two are easy to confuse:
 
 Hence the default: paint the transparent area in the terminal's own background
 colour so the rectangle blends in instead of reading as a black slab. The colour
-is auto-detected from your active Konsole colour scheme (`[Background]`), or
-failing that from `$COLORFGBG`. Set `@catwalk-bg` to a hex colour (e.g.
-`#1e1e2e`) to force one.
+is auto-detected from your active Konsole colour scheme (`[Background]`), then
+from the active iTerm2 profile, and failing both from `$COLORFGBG`. Set
+`@catwalk-bg` to a hex colour (e.g. `#1e1e2e`) to force one.
+
+`$COLORFGBG` is the weakest of the three on purpose: it names an ANSI palette
+*index*, and index 0 reads as pure black for every dark theme however far from
+black the theme actually is. A terminal whose own configuration can be read is
+therefore asked first.
 
 On a semi-transparent or blurred terminal that still looks wrong, because a
 solid rectangle cannot follow the blur.
