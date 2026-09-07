@@ -49,13 +49,14 @@ catgif() {
 # put a different animal in every window at the same instant, and the whole
 # point of deriving everything from the clock is that they agree.
 #
-# Symlinks count (-xtype f resolves them), subdirectories deliberately do not.
+# Symlinks count, subdirectories deliberately do not. BSD find has no -xtype,
+# so -L plus -type f is what resolves the link and still skips a broken one.
 catgifs() {
     local g
     g="$(catgif)"
     [[ -n "$g" ]] || return 0
     if [[ -d "$g" ]]; then
-        find "$g" -maxdepth 1 -xtype f -iname '*.gif' -print 2>/dev/null | LC_ALL=C sort
+        find -L "$g" -maxdepth 1 -type f -iname '*.gif' -print 2>/dev/null | LC_ALL=C sort
     else
         printf '%s\n' "$g"
     fi
