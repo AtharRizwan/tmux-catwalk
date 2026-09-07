@@ -566,10 +566,27 @@ FRAME_US=$((1000000 / FPS))
 # middle of another's ffmpeg run, and half-written .six files get catted
 # straight to the terminal.
 LOCK_FD=""
+LOCK_DIR=""
+mkdir -p "$CACHE" 2>/dev/null
 if require_cmd flock; then
-    mkdir -p "$CACHE" 2>/dev/null
     exec 9>"$CACHE/.lock" && LOCK_FD=9
     [[ -n "$LOCK_FD" ]] && flock 9 2>/dev/null
+elif [[ -d "$CACHE" ]]; then
+    # macOS ships no flock(1), and an unserialised cache is not a smaller
+    # problem there than it is here. mkdir is the portable atomic test-and-set.
+    # Bounded on purpose: a cat killed mid-preparation leaves the directory
+    # behind with no trap installed yet to remove it, and waiting for ever on a
+    # holder that no longer exists would freeze every cat on the machine. After
+    # the wait, break the lock and take it - the worst case is the unserialised
+    # cache this whole block is trying to avoid, which is where we started.
+    for ((_lk = 0; _lk < 100; _lk++)); do
+        mkdir "$CACHE/.lockdir" 2>/dev/null && { LOCK_DIR="$CACHE/.lockdir"; break; }
+        sleep 0.1
+    done
+    if [[ -z "$LOCK_DIR" ]]; then
+        rm -rf "$CACHE/.lockdir" 2>/dev/null
+        mkdir "$CACHE/.lockdir" 2>/dev/null && LOCK_DIR="$CACHE/.lockdir"
+    fi
 fi
 
 # prepare_variant <gif-index> <flip> - make sure one variant's frames exist on
@@ -593,10 +610,16 @@ prepare_variant() {
     key="${key}-f10-${MODE}-${CELLW}x${CELLH}-p${TOPPAD}"
     ((flip)) && key="${key}-flip"
     dir="$CACHE/$key"
+    # A peer's `rm -rf` used to be able to land between another cat's mkdir and
+    # its touch, and a bare touch recreates the key as an empty *file*. No later
+    # mkdir can turn that back into a directory and the -type d prune never
+    # sweeps it, so one lost race poisoned that GIF for good. `touch -c` below
+    # is what stops it happening; this clears anything left from before.
+    [[ -e "$dir" && ! -d "$dir" ]] && rm -f "$dir"
     mkdir -p "$dir" || die "cannot create cache dir $dir"
     # Touching our own dirs on each start is what keeps them out of the prune
     # sweep below.
-    touch "$dir" 2>/dev/null
+    touch -c "$dir" 2>/dev/null
 
     if ! ls "$dir"/f*.png >/dev/null 2>&1; then
         rm -rf "$dir"
@@ -739,6 +762,7 @@ if [[ -n "$LOCK_FD" ]]; then
     flock -u 9 2>/dev/null
     exec 9>&-
 fi
+[[ -n "$LOCK_DIR" ]] && rmdir "$LOCK_DIR" 2>/dev/null
 
 # load_variant <v> - bring one variant's payloads into this process, the first
 # time it is about to be drawn. Forking `cat` for every frame meant ~40 processes
@@ -936,7 +960,7 @@ make_bg() {
     rows=$((PANEH - 1))
     ((rows < 1)) && rows=1
     mkdir -p "$CACHE/bg" 2>/dev/null
-    touch "$CACHE/bg" 2>/dev/null
+    touch -c "$CACHE/bg" 2>/dev/null
     f="$CACHE/bg/${PANEW}x${rows}-${CELLW}x${CELLH}-${BG#\#}.six"
     if [[ ! -f "$f" ]]; then
         px=$((PANEW * CELLW))
