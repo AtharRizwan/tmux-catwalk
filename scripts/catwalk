@@ -46,6 +46,11 @@ MODE="$(catmode)"
 # marker back so the cache key stays "transparent" however the path was reached,
 # and so the cover strips the sixel path needs are never built for it.
 [[ "$MODE" == "kitty" ]] && BG="transparent"
+# The other direction: @catwalk-bg asked for transparency the terminal cannot
+# give, so catmode fell back to sixel. chafa rejects `transparent` as a colour
+# outright, which used to fail every frame; resolve the opaque slab the sixel
+# path would have used had the marker never been set.
+[[ "$MODE" == "sixel" && "$BG" == "transparent" ]] && BG="$(catbg_auto)"
 
 # --- the pool ---------------------------------------------------------------
 # GIFSRC is what the user configured; POOL is what that expands to. A directory

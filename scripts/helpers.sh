@@ -144,13 +144,22 @@ catsixel_ok() {
 # for the Kitty graphics path, which has a real alpha channel. It is returned
 # untouched here and resolved by catmode.
 catbg() {
+    local v
+    v="$(catcfg CATWALK_BG catwalk-bg '')"
+    [[ -n "$v" ]] && { printf '%s' "$v"; return; }
+    catbg_auto
+}
+
+# catbg_auto - the terminal-derived half of the chain, with @catwalk-bg left
+# out. The sixel path calls it directly when @catwalk-bg asked for the
+# `transparent` marker and no Kitty graphics were there to honour it: chafa
+# rejects that word as a colour, so the fallback has to resolve a real one.
+catbg_auto() {
     local v profile file r g b
     # Must be initialised: `local scheme` alone leaves it *unset*, and reading
     # an unset variable under `set -u` aborts the function - which is what used
     # to happen on every non-Konsole system.
     local scheme=""
-    v="$(catcfg CATWALK_BG catwalk-bg '')"
-    [[ -n "$v" ]] && { printf '%s' "$v"; return; }
 
     profile="$(awk -F= '/^DefaultProfile=/{print $2; exit}' "$HOME/.config/konsolerc" 2>/dev/null)"
     if [[ -n "$profile" && -f "$HOME/.local/share/konsole/$profile" ]]; then
