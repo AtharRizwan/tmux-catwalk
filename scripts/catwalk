@@ -254,6 +254,28 @@ fi
 HAVE_COVER=0
 ((${#BGR_BGR[@]} == 3)) && HAVE_COVER=1
 
+# Background columns baked onto both sides of every frame, so that drawing a
+# frame one step along also erases where the cat just was.
+#
+# This is what stops the blink. A cover strip and the frame that replaced it were
+# two separate images, and nothing below this script batches them: tmux does not
+# wrap the *active* pane's sixel output in a synchronized update, so the terminal
+# was free to present the strip with the cat erased and not yet redrawn. A frame
+# that carries its own erase cannot be caught half-done, because there is no
+# half.
+#
+# One step's worth is enough. A frame moves ceil(SPEED_MAX/10) columns, and the
+# stall guard in the draw loop repaints outright rather than let a skipped tick
+# double that. The cap keeps a silly @catwalk-step from padding the frame wider
+# than the cat. Only the sixel path needs it - a kitty placement is deleted, not
+# painted over - and without a background colour there is nothing to pad with.
+PAD_COLS=0
+if [[ "$MODE" == "sixel" ]] && ((HAVE_COVER)); then
+    PAD_COLS=$(((SPEED_MAX + 9) / 10))
+    ((PAD_COLS > 4)) && PAD_COLS=4
+fi
+PAD_PX=$((PAD_COLS * CELLW))
+
 # --- dependencies -----------------------------------------------------------
 require_cmd ffmpeg || die "ffmpeg is required (gif frame extraction)"
 require_cmd ffprobe || die "ffprobe is required (gif aspect detection)"
@@ -277,7 +299,7 @@ fi
 # Each GIF gets its own column width and therefore its own scale target. The
 # md5 of the file is the head of its cache key, so two GIFs can never collide -
 # and neither can two *variants* of one GIF (see prepare_variant).
-declare -a GIF_FACING=() GIF_CATW=() GIF_TGTW=() GIF_MD5=()
+declare -a GIF_FACING=() GIF_CATW=() GIF_TGTW=() GIF_PADW=() GIF_MD5=()
 for ((g = 0; g < NGIFS; g++)); do
     GIF_FACING[g]="$(catfacing "${POOL[g]}" "$FACING")"
     GIF_MD5[g]="$(md5sum "${POOL[g]}" 2>/dev/null | cut -d' ' -f1)"
@@ -300,6 +322,7 @@ for ((g = 0; g < NGIFS; g++)); do
         ((tw > 0)) || tw=1
     fi
     GIF_TGTW[g]="$tw"
+    GIF_PADW[g]=$((tw + 2 * PAD_PX))
 done
 
 # --- render state -----------------------------------------------------------
@@ -320,7 +343,8 @@ SIX_TOTAL=0
 # arithmetic - the critter born in spawn slot k walks in lane k % LANES - and
 # there are enough lanes that one is always clear before it comes round again
 # (see update_geom). Each lane remembers what it last put on the glass, which is
-# what the next frame's placement delete, or cover strip, has to undo.
+# what the next frame has to undo - by deleting the placement, by drawing its own
+# padding over it, or by covering it.
 declare -a LANE_LIVE=() LANE_PREVX=() LANE_PREVVAR=()
 declare -a LANE_PID=() LANE_PREV_ID=() LANE_PREV_PID=()
 # init_lanes - (re)build the lane bookkeeping for the current LANES. Called
@@ -608,6 +632,7 @@ prepare_variant() {
     [[ -n "$BG" ]] && key="${key}-${BG#\#}"
     # bump when the post-processing changes so cached frames re-render
     key="${key}-f10-${MODE}-${CELLW}x${CELLH}-p${TOPPAD}"
+    ((PAD_COLS > 0)) && key="${key}-w${PAD_COLS}"
     ((flip)) && key="${key}-flip"
     dir="$CACHE/$key"
     # A peer's `rm -rf` used to be able to land between another cat's mkdir and
@@ -628,6 +653,9 @@ prepare_variant() {
         # One hflip is the whole of mirroring: a critter walking against the way
         # its artwork faces would otherwise moonwalk across the pane.
         ((flip)) && vf="${vf},hflip"
+        # The pad goes on last, after the mirror, so both sides stay even.
+        ((PAD_COLS > 0)) &&
+            vf="${vf},pad=${GIF_PADW[g]}:${TGT_H}:${PAD_PX}:0:color=0x${BG#\#}"
         ffmpeg -y -loglevel error -i "${POOL[g]}" -vf "$vf" "$dir/f%03d.png" 2>/dev/null || true
     fi
 
@@ -671,7 +699,8 @@ prepare_variant() {
     i=0
     for png in "${pngs[@]}"; do
         out="${png%.png}.six"
-        render_sixel "$png" "$out" "${GIF_CATW[g]}" "${GIF_TGTW[g]}" ||
+        render_sixel "$png" "$out" "$((${GIF_CATW[g]} + 2 * PAD_COLS))" \
+            "${GIF_PADW[g]}" ||
             die "chafa failed to render ${png##*/}"
         SIXFILE[VAR_OFF[v] + i]="$out"
         i=$((i + 1))
@@ -688,7 +717,7 @@ prepare_variant() {
             if python3 "$SCRIPT_DIR/sixelfill.py" cover "${SIXFILE[VAR_OFF[v]]}" \
                 "${VAR_COVER[v]}.tmp.$$" \
                 "${BGR_BGR[0]}" "${BGR_BGR[1]}" "${BGR_BGR[2]}" \
-                --target "${GIF_TGTW[g]}x${TGT_H}" 2>/dev/null; then
+                --target "${GIF_PADW[g]}x${TGT_H}" 2>/dev/null; then
                 mv -f "${VAR_COVER[v]}.tmp.$$" "${VAR_COVER[v]}"
             else
                 rm -f "${VAR_COVER[v]}.tmp.$$"
@@ -943,8 +972,8 @@ update_geom() {
     return 0
 }
 
-# A full-pane rectangle in the terminal background color. The cat draws on top
-# of it and the cover strip erases the old cat position with the same color.
+# A full-pane rectangle in the terminal background color. The cat draws on top of
+# it, and erases its own last position in the same color as it goes.
 # The filename carries the pane geometry: this used to be a single bg.six whose
 # size was whatever the first window to start happened to be, which every other
 # window then reused at the wrong size.
@@ -1180,14 +1209,38 @@ draw_kitty() {
 # overlapping critters from rubbing each other out. Doing it the obvious way -
 # cover then draw, per critter - would have the second one's cover punch a hole
 # in the first one.
+#
+# Most frames now cover nothing. A frame carries PAD_COLS of background on each
+# side, so drawing it one step along erases where the cat was in the same image
+# that draws it where the cat is. A cover is left for the two things padding
+# cannot reach: a lane that has gone empty, and a jump longer than the pad.
+# That is what stops the blink - see PAD_COLS.
+#
+# Placement backs off by the pad, so the cat itself still lands on x. Clamped at
+# the left edge, where the cat is walking in half off-pane and a column of
+# stutter costs nothing; the cover is clamped identically so the two always
+# agree on what was drawn.
 draw_sixel() {
-    local i out="" v x
+    local i out="" v x px d col
     for ((i = 0; i < LANES; i++)); do
-        ((${LANE_PREVX[i]} >= 0)) || continue
+        px=${LANE_PREVX[i]}
+        ((px >= 0)) || continue
         v=${LANE_PREVVAR[i]}
-        [[ -n "${COVERDATA[v]:-}" ]] || continue
-        printf -v out '%s\033[%d;%dH%s' "$out" "$ROW" \
-            "$((${LANE_PREVX[i]} + 1))" "${COVERDATA[v]}"
+        if [[ -z "${COVERDATA[v]:-}" ]]; then
+            # sixelfill failed to build this variant's cover. Nothing here can
+            # erase the lane and loop 2 is about to forget where it was, so ask
+            # for a repaint rather than strand the frame on the glass for good.
+            NEED_BG=1
+            continue
+        fi
+        if ((${LANE_LIVE[i]} >= 0)); then
+            d=$((${LIVE_X[i]} - px))
+            ((d < 0)) && d=$((-d))
+            ((d <= PAD_COLS)) && continue
+        fi
+        col=$((px + 1 - PAD_COLS))
+        ((col < 1)) && col=1
+        printf -v out '%s\033[%d;%dH%s' "$out" "$ROW" "$col" "${COVERDATA[v]}"
     done
     for ((i = 0; i < LANES; i++)); do
         LANE_PREVX[i]=-1
@@ -1195,7 +1248,9 @@ draw_sixel() {
         v=${LIVE_VAR[i]}
         load_variant "$v"
         x=${LIVE_X[i]}
-        printf -v out '%s\033[%d;%dH%s' "$out" "$ROW" "$((x + 1))" \
+        col=$((x + 1 - PAD_COLS))
+        ((col < 1)) && col=1
+        printf -v out '%s\033[%d;%dH%s' "$out" "$ROW" "$col" \
             "${SIXDATA[${VAR_OFF[v]} + ${LIVE_IDX[i]}]}"
         LANE_PREVX[i]=$x
         LANE_PREVVAR[i]=$v
@@ -1251,10 +1306,10 @@ while :; do
     steps=$((now / FRAME_US))
     # A gap in the frame numbers means we were stalled - starved of time while
     # tmux was busy with a resurrect save, say - and the clock has since moved
-    # every critter well away from where its cover strip is. The covers are one
-    # critter wide and erase a single step, so repaint the whole strip instead of
-    # leaving pre-stall frames stranded with nothing sized to cover them.
-    ((steps - last_steps > 2)) && NEED_BG=1
+    # every critter further than one step. A frame erases its own last position
+    # and no more (see PAD_COLS), so anything longer than a single tick has to
+    # repaint the whole strip rather than leave pre-stall frames stranded.
+    ((steps - last_steps > 1)) && NEED_BG=1
     last_steps=$steps
 
     if ((SPAWN)); then

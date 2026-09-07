@@ -297,9 +297,9 @@ placement can be *deleted*, where a sixel can only be painted over:
 
 - **No blink.** Toggling cats off or zooming a pane no longer cycles the
   alternate screen, so the screen does not flash.
-- **Much less output.** A sixel tick writes the whole frame plus a cover strip,
-  about 13 KB; a Kitty tick writes a place and a delete, about 90 bytes. Frames
-  are transmitted once at startup and then only referenced.
+- **Much less output.** A sixel tick writes the whole frame, about 13 KB; a
+  Kitty tick writes a place and a delete, about 90 bytes. Frames are transmitted
+  once at startup and then only referenced.
 - **Correct size everywhere.** Sixels are measured by tmux using the *window's*
   cell size, which can be stale (see the troubleshooting note below). Kitty
   frames never pass through tmux, so that failure mode does not exist.
@@ -320,12 +320,21 @@ below it.
   chafa (cached, keyed by GIF + size + background + padding + protocol +
   mirroring), post-processes them with `sixelfill.py` to paint an opaque
   background under the sprite, and then walks the sprites across the pane.
-- Frames are held in memory and each sprite's position is erased with a
-  background-colored "cover" strip rather than a screen clear, so the animation
-  costs a `sleep` and a `printf` per frame. Every cover for the tick is emitted
-  before any sprite is: a later sixel placement draws over an earlier one, so
-  erasing everybody first is what stops two overlapping critters from rubbing
-  each other out.
+- Frames are held in memory and a sprite erases its own last position rather
+  than the strip being cleared, so the animation costs a `sleep` and a `printf`
+  per frame. On the sixel path each frame is baked with a column of background
+  on both sides, so drawing it one step along paints over where the sprite just
+  was, in the same image. That matters for more than tidiness: a separate erase
+  and a separate redraw are two images, and nothing below this script batches
+  them - tmux does not wrap the *active* pane's sixel output in a synchronized
+  update - so the terminal was free to show the strip with the sprite erased and
+  not yet redrawn, ten times a second.
+
+  A "cover" strip, an opaque rectangle in the background colour, is still drawn
+  for the two cases padding cannot reach: a lane that has gone empty, and a jump
+  longer than the padding. Every cover for the tick is emitted before any sprite
+  is: a later sixel placement draws over an earlier one, so erasing first is what
+  stops two overlapping critters from rubbing each other out.
 - In directory mode each critter walks in a *lane*, and a lane is pure
   arithmetic: the critter born in spawn slot `k` uses lane `k % LANES`. There are
   as many lanes as the slowest possible crossing needs, so a lane is always clear
