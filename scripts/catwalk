@@ -390,11 +390,15 @@ if [[ -n "${TMUX_PANE:-}" ]]; then
         tmux set-option -p -t "$PANE_ID" allow-passthrough all 2>/dev/null
     fi
 fi
-# Which of the twenty ticks in the housekeeping period this cat uses. Every cat
-# one catensure-all starts wakes on the same instants - that is the whole design
-# - so on tick zero all of them would fork their three tmux commands at once and
-# queue behind the single server thread. Spreading the burst over the period
-# keeps one cat's slow tick from being every cat's slow tick.
+# Which of the twenty ticks in the housekeeping period this cat uses from its
+# second check onwards. Every cat one catensure-all starts wakes on the same
+# instants - that is the whole design - so all of them would fork their three
+# tmux commands together and queue behind the single server thread. Spreading
+# the burst over the period keeps one cat's slow tick from being every cat's.
+#
+# The first check is not phased: a cat has to know whether its window is on
+# screen before it draws, and waiting two seconds for that would have it paint
+# over the window you are actually looking at.
 CHECK_PHASE=0
 [[ "${PANE_ID#%}" =~ ^[0-9]+$ ]] && CHECK_PHASE=$((${PANE_ID#%} % 20))
 
@@ -507,7 +511,15 @@ update_clients() {
     # Take our placements off the outgoing audience's glass before the incoming
     # one is drawn to. On a terminal that never received the images - and on the
     # outgoing one, if it is already gone - the deletes are no-ops.
-    ((${#VAR_LOADED[@]})) && kitty_clear
+    #
+    # Only once there is an outgoing audience at all, which is what TX_SIG says
+    # and VAR_LOADED does not: that counts variants *prepared*, so it is already
+    # non-empty on the first call, when nothing has been uploaded or placed. The
+    # sweep deletes by image id, which every cat drawing this pool shares, so a
+    # cat with nothing of its own on the glass takes its live peers down instead.
+    # catensure-all starts one cat per window, and toggling the cats on then cost
+    # one blink per window before the strip settled.
+    [[ -n "$TX_SIG" ]] && ((${#VAR_LOADED[@]})) && kitty_clear
     for v in "${!VAR_LOADED[@]}"; do
         VAR_LOADED[v]=0
     done
@@ -1296,7 +1308,7 @@ while :; do
     # If our tmux server is gone (kill-server) we are orphaned - bow out
     # gracefully so we don't leak. Same cadence for the window bookkeeping:
     # this used to fork `tmux list-panes` and `wc` on every single frame.
-    if ((tick++ % 20 == CHECK_PHASE || NEED_CHECK)); then
+    if ((tick == 0 || tick % 20 == CHECK_PHASE || NEED_CHECK)); then
         poked=$NEED_CHECK
         NEED_CHECK=0
         tmux has-session >/dev/null 2>&1 || break
@@ -1326,6 +1338,7 @@ while :; do
             NEED_BG=1
         fi
     fi
+    tick=$((tick + 1))
     now=${EPOCHREALTIME/[.,]/}
     steps=$((now / FRAME_US))
     # A stall needs nothing done about it, however far the clock has moved the
