@@ -264,11 +264,12 @@ HAVE_COVER=0
 # that carries its own erase cannot be caught half-done, because there is no
 # half.
 #
-# One step's worth is enough. A frame moves ceil(SPEED_MAX/10) columns, and the
-# stall guard in the draw loop repaints outright rather than let a skipped tick
-# double that. The cap keeps a silly @catwalk-step from padding the frame wider
-# than the cat. Only the sixel path needs it - a kitty placement is deleted, not
-# painted over - and without a background colour there is nothing to pad with.
+# One step's worth is enough. A frame moves ceil(SPEED_MAX/10) columns, and a
+# tick that skips - so a critter moves two steps or twenty - falls back to the
+# cover in draw_sixel, which is sized and placed for whatever the jump was. The
+# cap keeps a silly @catwalk-step from padding the frame wider than the cat. Only
+# the sixel path needs any of this - a kitty placement is deleted, not painted
+# over - and without a background colour there is nothing to pad with.
 PAD_COLS=0
 if [[ "$MODE" == "sixel" ]] && ((HAVE_COVER)); then
     PAD_COLS=$(((SPEED_MAX + 9) / 10))
@@ -389,6 +390,13 @@ if [[ -n "${TMUX_PANE:-}" ]]; then
         tmux set-option -p -t "$PANE_ID" allow-passthrough all 2>/dev/null
     fi
 fi
+# Which of the twenty ticks in the housekeeping period this cat uses. Every cat
+# one catensure-all starts wakes on the same instants - that is the whole design
+# - so on tick zero all of them would fork their three tmux commands at once and
+# queue behind the single server thread. Spreading the burst over the period
+# keeps one cat's slow tick from being every cat's slow tick.
+CHECK_PHASE=0
+[[ "${PANE_ID#%}" =~ ^[0-9]+$ ]] && CHECK_PHASE=$((${PANE_ID#%} % 20))
 
 # --- discarding what we painted ---------------------------------------------
 # Glyph and erase-display overwrites do not remove sixels on Konsole (KDE bug
@@ -425,8 +433,8 @@ kitty_pass() {
     printf '\033Ptmux;%s\033\\' "${1//$'\033'/$'\033\033'}"
 }
 
-# kitty_clear - drop every placement of the whole pool, not merely of the
-# variants this process happens to have uploaded.
+# kitty_clear_raw / kitty_clear - drop every placement of the whole pool, not
+# merely of the variants this process happens to have uploaded.
 #
 # The wider sweep is what takes another session's ghosts off the glass. A cat
 # erases through a passthrough, which tmux forwards only to the clients attached
@@ -447,18 +455,32 @@ kitty_pass() {
 #
 # Deliberately not d=a, which would take out every visible placement in the
 # terminal, including other programs'.
-kitty_clear() {
-    local v i raw=""
+#
+# The sweep is built into CLEAR_RAW rather than written, so a caller that is
+# about to draw can put the deletes and the frames that replace them in one
+# payload. A repaint that writes them separately blanks the strip for however
+# long the terminal takes to get to the second write, which is a blink. The
+# answer comes back in a variable for the same reason cathash's does: a command
+# substitution is a subshell, and the lane reset below would not survive one.
+CLEAR_RAW=""
+kitty_clear_raw() {
+    local v i
+    CLEAR_RAW=""
     for v in "${!VAR_LOADED[@]}"; do
         for ((i = 0; i < ${VAR_N[v]}; i++)); do
-            printf -v raw '%s\033_Ga=d,d=i,i=%d\033\\' "$raw" "$((${VAR_IDBASE[v]} + i))"
+            printf -v CLEAR_RAW '%s\033_Ga=d,d=i,i=%d\033\\' \
+                "$CLEAR_RAW" "$((${VAR_IDBASE[v]} + i))"
         done
     done
-    kitty_pass "$raw"
     for ((i = 0; i < LANES; i++)); do
         LANE_PREV_ID[i]=""
         LANE_PREV_PID[i]=""
     done
+}
+
+kitty_clear() {
+    kitty_clear_raw
+    kitty_pass "$CLEAR_RAW"
 }
 
 # --- who is watching --------------------------------------------------------
@@ -1168,12 +1190,14 @@ classic_live() {
     return 0
 }
 
-# draw_kitty - one payload for the whole strip. The cursor moves, the placements
-# and the deletes all go out together so nothing of tmux's own can interleave
-# and move the cursor between them, which means one repaint per tick and
-# therefore no flicker.
+# draw_kitty [prefix] - one payload for the whole strip. The cursor moves, the
+# placements and the deletes all go out together so nothing of tmux's own can
+# interleave and move the cursor between them, which means one repaint per tick
+# and therefore no flicker. A repaint's whole-pool sweep comes in as the prefix
+# for that same reason: written on its own it would leave the strip empty until
+# this payload arrived.
 draw_kitty() {
-    local i raw="" id v x
+    local i raw="${1:-}" id v x
     for ((i = 0; i < LANES; i++)); do
         if ((${LANE_LIVE[i]} < 0)); then
             # Lane just emptied: take its last frame off the glass.
@@ -1213,8 +1237,9 @@ draw_kitty() {
 # Most frames now cover nothing. A frame carries PAD_COLS of background on each
 # side, so drawing it one step along erases where the cat was in the same image
 # that draws it where the cat is. A cover is left for the two things padding
-# cannot reach: a lane that has gone empty, and a jump longer than the pad.
-# That is what stops the blink - see PAD_COLS.
+# cannot reach: a lane that has gone empty, and a jump longer than the pad -
+# which is any tick the loop skipped, and is why a stall needs nothing else done
+# about it. That is what stops the blink - see PAD_COLS.
 #
 # Placement backs off by the pad, so the cat itself still lands on x. Clamped at
 # the left edge, where the cat is walking in half off-pane and a column of
@@ -1267,12 +1292,11 @@ draw_sixel() {
 # means separate cats agree by construction and cannot come apart.
 steps=0
 tick=0
-last_steps=$((${EPOCHREALTIME/[.,]/} / FRAME_US))
 while :; do
     # If our tmux server is gone (kill-server) we are orphaned - bow out
     # gracefully so we don't leak. Same cadence for the window bookkeeping:
     # this used to fork `tmux list-panes` and `wc` on every single frame.
-    if ((tick++ % 20 == 0 || NEED_CHECK)); then
+    if ((tick++ % 20 == CHECK_PHASE || NEED_CHECK)); then
         poked=$NEED_CHECK
         NEED_CHECK=0
         tmux has-session >/dev/null 2>&1 || break
@@ -1304,13 +1328,10 @@ while :; do
     fi
     now=${EPOCHREALTIME/[.,]/}
     steps=$((now / FRAME_US))
-    # A gap in the frame numbers means we were stalled - starved of time while
-    # tmux was busy with a resurrect save, say - and the clock has since moved
-    # every critter further than one step. A frame erases its own last position
-    # and no more (see PAD_COLS), so anything longer than a single tick has to
-    # repaint the whole strip rather than leave pre-stall frames stranded.
-    ((steps - last_steps > 1)) && NEED_BG=1
-    last_steps=$steps
+    # A stall needs nothing done about it, however far the clock has moved the
+    # critters meanwhile: each path undoes the exact placement it made last, by
+    # deleting that placement's own id or by covering LANE_PREVX. Repainting the
+    # strip on a skipped tick was the two-second blink.
 
     if ((SPAWN)); then
         collect_live
@@ -1334,11 +1355,12 @@ while :; do
             # No background to lay down and nothing to cover: the placement
             # carries its own alpha, and the previous one is deleted rather than
             # painted over. A repaint is just "drop everything and place again".
+            CLEAR_RAW=""
             if ((NEED_BG)); then
-                kitty_clear
+                kitty_clear_raw
                 NEED_BG=0
             fi
-            draw_kitty
+            draw_kitty "$CLEAR_RAW"
         fi
     else
         if ((NEED_BG)); then
@@ -1360,11 +1382,15 @@ while :; do
 
     # Sleep to the next frame boundary rather than for a fixed delay: that keeps
     # every cat waking on the same instants, and it is self-correcting, so a slow
-    # frame is caught up instead of accumulating. A skipped frame is safe - the
-    # cover strips are drawn wherever the critters actually last appeared, so a
-    # jump still erases cleanly and leaves no trail.
-    delay=$(((steps + 1) * FRAME_US - ${EPOCHREALTIME/[.,]/}))
-    ((delay > 0)) || delay=$FRAME_US
+    # frame is caught up instead of accumulating.
+    #
+    # A tick that overran its boundary has to go to the *next* one, not sleep a
+    # whole period from wherever it finished: a full period always lands past a
+    # boundary and drops a frame, which is how the two-second housekeeping burst
+    # turned into a visible stutter on a busy machine.
+    now=${EPOCHREALTIME/[.,]/}
+    delay=$(((steps + 1) * FRAME_US - now))
+    ((delay > 0)) || delay=$((FRAME_US - now % FRAME_US))
     printf -v nap '%d.%06d' "$((delay / 1000000))" "$((delay % 1000000))"
     sleep "$nap"
 done

@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 while IFS=' ' read -r pane pid; do
     [[ -n "$pane" ]] || continue
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    grep -qa catwalk "/proc/$pid/cmdline" 2>/dev/null || continue
+    catisours "$pid" || continue
     kill -TERM "$pid" 2>/dev/null || true
 done < <(tmux list-panes -a -f '#{@catwalk}' \
     -F '#{pane_id} #{@catwalk-pid}' 2>/dev/null)

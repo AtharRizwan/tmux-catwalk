@@ -332,9 +332,10 @@ below it.
 
   A "cover" strip, an opaque rectangle in the background colour, is still drawn
   for the two cases padding cannot reach: a lane that has gone empty, and a jump
-  longer than the padding. Every cover for the tick is emitted before any sprite
-  is: a later sixel placement draws over an earlier one, so erasing first is what
-  stops two overlapping critters from rubbing each other out.
+  longer than the padding - which is any tick the loop was too busy to run, so a
+  stall needs nothing done about it. Every cover for the tick is emitted before
+  any sprite is: a later sixel placement draws over an earlier one, so erasing
+  first is what stops two overlapping critters from rubbing each other out.
 - In directory mode each critter walks in a *lane*, and a lane is pure
   arithmetic: the critter born in spawn slot `k` uses lane `k % LANES`. There are
   as many lanes as the slowest possible crossing needs, so a lane is always clear
@@ -342,14 +343,17 @@ below it.
   `@catwalk-max-cats`, and means nothing ever has to be turned away for want of
   one. `@catwalk-max-cats` sets the spawn *rate* instead.
 - On the transparent path the frames are not rendered to sixel at all.
-  `catkitty.py` turns the extracted PNGs into one chunked Kitty
-  `a=t` (transmit) blob per GIF, printed the first time that critter appears;
-  each tick then only prints an
-  absolute `CSI H`, an `a=p` (place) for the new frame and an `a=d,d=i` (delete)
-  for the previous one, in a single passthrough payload. Because tmux never
-  moves the cursor for passthrough output, the cat computes its own
-  terminal-absolute origin from `pane_top`/`pane_left` and the status-bar
-  position, and recomputes it whenever the layout changes.
+  `catkitty.py` turns the extracted PNGs into one chunked Kitty `a=t` (transmit)
+  blob per GIF, printed the first time that critter appears; each tick then only
+  prints an absolute `CSI H`, an `a=p` (place) for the new frame and an
+  `a=d,d=i` (delete) for the previous one, in a single passthrough payload. A
+  repaint - a resize, a client change, an unzoom - drops every placement of the
+  pool first, and those deletes travel in that same payload rather than one of
+  their own: sent separately they leave the strip empty until the frames catch
+  up, which is a blink. Because tmux never moves the cursor for passthrough
+  output, the cat computes its own terminal-absolute origin from
+  `pane_top`/`pane_left` and the status-bar position, and recomputes it whenever
+  the layout changes.
 - Those uploaded frames live in the *terminal*, not in tmux, and a passthrough
   only reaches a terminal that has a client attached - with none, tmux drops it.
   So a cat also tracks which clients are attached to its session: it draws

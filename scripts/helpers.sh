@@ -391,6 +391,20 @@ catresurrect_dir() {
     printf '%s' "${d/#\~/$HOME}"
 }
 
+# catisours <pid> - true when that pid really is one of our cats. Pids are
+# reused and the @catwalk-pid pane option outlives nothing, so whoever is about
+# to be signalled has to be identified by name first.
+#
+# /proc is what catpoke and catkill used to read, which is no file at all on
+# macOS: the grep failed for every pid, every cat was skipped, and both scripts
+# quietly stopped signalling anything. catkill then fell through to kill-pane,
+# which takes the pane away before the cat can erase itself and left the last
+# frame stranded on the terminal.
+catisours() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]] || return 1
+    [[ "$(ps -o args= -p "$1" 2>/dev/null)" == *catwalk* ]]
+}
+
 # catrestore_running - true while tmux-resurrect is actively rebuilding the
 # server.
 catrestore_running() {
